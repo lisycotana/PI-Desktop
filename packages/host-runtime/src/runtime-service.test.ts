@@ -213,6 +213,10 @@ describe("RuntimeService prompt lifecycle", () => {
     expect(turnId).toBe("turn-1");
     const methods = host.calls.map((call) => call.method);
     expect(methods.indexOf("session.beginTurn")).toBeLessThan(methods.indexOf("session.appendMessage"));
+    expect(host.calls.find((call) => call.method === "session.beginTurn")?.params).toMatchObject({
+      sessionId: "s1",
+      permissionMode: "ask",
+    });
     const prompt = sidecar.calls.find((call) => call.method === "agent.prompt");
     expect(prompt?.params.turnId).toBe("turn-1");
     expect(prompt?.params.content).toBe("hello");

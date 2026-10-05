@@ -8,6 +8,7 @@ import {
   type AgentEventEnvelope,
   type AgentStatus,
   type AskToolResolution,
+  type RacpPermissionMode,
   type Risk,
   type UiMessage,
 } from "@pi-desktop/shared";
@@ -313,7 +314,13 @@ export class RuntimeService implements RuntimePort {
     const launch = await this.options.launch.resolve(sessionId, session, settings ?? {});
     sidecar.setProjectInstructionRoot(sessionId, launch.projectPath);
 
-    const turnId = await this.beginTurn(sessionId, launch.providerId, launch.modelId, sessionMessage?.origin.messageId);
+    const turnId = await this.beginTurn(
+      sessionId,
+      launch.providerId,
+      launch.modelId,
+      sessionMessage?.origin.messageId,
+      request.effectivePermissionMode,
+    );
 
     let content = sessionMessage?.content ?? request.content;
     let command: string | undefined;
@@ -522,12 +529,19 @@ export class RuntimeService implements RuntimePort {
   }
 
   /** Open a durable turn row and take ownership of the session for it. */
-  async beginTurn(sessionId: string, providerId: string, modelId: string, sessionMessageId?: string): Promise<string> {
+  async beginTurn(
+    sessionId: string,
+    providerId: string,
+    modelId: string,
+    sessionMessageId?: string,
+    permissionMode?: RacpPermissionMode,
+  ): Promise<string> {
     const turn = await this.requireHost().call<{ turnId?: string }>("session.beginTurn", {
       sessionId,
       providerId,
       modelId,
       ...(sessionMessageId ? { sessionMessageId } : {}),
+      ...(permissionMode ? { permissionMode } : {}),
     });
     const turnId = String(turn?.turnId ?? "").trim();
     if (!turnId) throw new Error("session.beginTurn returned no turn");

@@ -16,8 +16,8 @@ const { IPC } = await import("@pi-desktop/shared");
  * The bridge exposes an `agentHost` whose `startTurn` runs the same runtime
  * port the Electron composition wires. These tests reach through it to verify
  * the per-turn permission-ceiling policy: a widening request refuses, a
- * narrower request passes through with the mode forwarded as a per-turn
- * override, and a matching request stays silent.
+ * narrower and matching requests pass their effective modes through to the
+ * durable Host turn.
  */
 function fixture({ sessionPermissionMode }) {
   const prompts = [];
@@ -70,7 +70,7 @@ async function callStart(bridge, principal, effective) {
   }).catch((error) => error);
 }
 
-test("a matching session/effective mode leaves the sidecar call without an override", async () => {
+test("a matching session/effective mode is still bound to the durable turn", async () => {
   const { bridge, prompts } = fixture({ sessionPermissionMode: "auto" });
   const outcome = await callStart(bridge, DESKTOP_PRINCIPAL);
   assert.ok(outcome && (outcome.accepted === true || outcome.turn), "startTurn should accept");
@@ -78,8 +78,8 @@ test("a matching session/effective mode leaves the sidecar call without an overr
   assert.ok(promptCall, "sidecar prompt must be invoked");
   assert.equal(
     promptCall.request.permissionMode,
-    undefined,
-    "matching mode must not attach a per-turn override",
+    "auto",
+    "matching mode must remain a per-turn ceiling if durable policy changes later",
   );
 });
 

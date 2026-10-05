@@ -16797,3 +16797,55 @@ host-created files. The full app's file-preview viewer is covered separately.
   image model selection and provider configuration remain available.
 - Coverage: recent-models.test.mjs, recent-model-flow.test.mjs,
   default-model-picker.test.mjs, and scripts/e2e-composer-model-selection.mjs.
+## E2E-MOBILE-COMPANION-same-desktop-session (planned)
+
+- **Preconditions:** Isolated Desktop data/profile/project, a mobile browser on
+  a private Tailscale HTTPS origin, explicit device pairing, and a deterministic
+  local provider fixture. No user's active Desktop or paid provider is used.
+- **Steps:** Create/start a session on Desktop; attach the phone to that same
+  session; observe output; resolve an approval; send a follow-up; stop; disconnect
+  and reconnect; resolve the same approval concurrently on both clients; revoke
+  the phone device.
+- **Expected:** One authoritative Host/session/transcript; no second runtime or
+  duplicate turn; original device principal and permission ceiling enforced at
+  execution; stale/duplicate approval rejected; cursor/snapshot recovery; revoked
+  devices lose access. No public IPC or provider credentials are exposed.
+- **Current coverage:** `apps/desktop/test/mobile-companion-same-host.test.mjs`
+  is a loopback network integration probe of the real Desktop bridge and RACP
+  core with fake external Host/runtime boundaries. Its result is not an
+  Electron/Rust/phone/Tailscale E2E pass. `mobile-companion-http.test.mjs` adds
+  real HTTP/SSE, same-host reads, pairing/Origin/CSRF, viewer-only access,
+  pagination, replay/resync, expiry, resource limits and startup cleanup.
+  Browser QA uses `helpers/mobile-preview.mjs` with isolated sample data.
+  Complete browser binding conformance, execution permission enforcement and
+  physical-device acceptance remain separate gates.
+- **Readiness:** [Mobile companion readiness](mobile-companion-readiness.md).
+
+
+## E2E-MOBILE-COMPANION-complete-task-workflow
+
+- **Scope:** Personal Tailscale PWA; voice deferred. The same Desktop AgentHost
+  owns execution/history, with a non-owner browser principal.
+- **User path:** Pair, create/select a registered-project session and supported
+  model/thinking level, upload bytes, send/retry once, inspect streaming thinking
+  and tool records, approve/answer, queue/prioritize/cancel, stop/interrupt, read
+  history/owned attachments, inspect all changed files/full patches, reconnect
+  and disconnect. Rename/fork/compact/delete require explicit UI actions.
+- **Expected:** No duplicate turn or cross-session stale draft; one resolution
+  for competing desktop/mobile approvals; no privilege widening, arbitrary native
+  path or generic IPC/Host RPC. No silently truncated raw tool result or full
+  patch. Shared bounded preview limits are visible. Unsent commands never replay.
+- **Automated evidence:** `mobile-task-workflow.test.mjs` enters actual HTTP
+  routes with real bridge/AgentHost/RACP, mocking only external Host/runtime.
+  `mobile-client-render.test.mjs` runs the real served client at the DOM/fetch
+  boundary. Diff/session-data/upload tests exercise actual filesystem boundaries.
+  The Host Rust test `per_turn_permission_scope_gates_actual_write_execution_and_subagent_scope`
+  proves the real tool runner requests approval before writing, including a
+  permissive subagent scope; denial writes nothing, approval writes exact bytes.
+- **Browser evidence:** Edge/TMWD through agent-browser-cli, isolated fixture:
+  pairing, model/thinking selection, upload/send, approval/input cards, queue
+  cancel/stop, complete patch, returned thinking, foreground resume. 320px/390px
+  layouts have no horizontal overflow; screenshots inspected. This is no claim
+  of physical-phone/Tailscale, real-provider or packaged-launch verification.
+- **Release gates:** Real phone HTTPS/PWA installation, cellular/Wi-Fi transition,
+  desktop sleep/restart and actual provider execution remain to be accepted.

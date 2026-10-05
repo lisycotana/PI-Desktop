@@ -14,6 +14,7 @@ import type { UserMcpRuntime } from "../user-mcp";
 import type { McpControlServer } from "../mcp-control";
 import type { McpOAuthManager } from "../mcp-oauth";
 import { getActiveRemoteHostsBoot, setActiveRemoteHostsBoot } from "./remote-hosts";
+import { getActiveMobileCompanion, setActiveMobileCompanion } from "./mobile-companion";
 import type { LiveCallService } from "../live-voice/call-service";
 
 const QUIT_TURN_SETTLE_BUDGET_MS = 2_000;
@@ -164,6 +165,9 @@ export function registerShutdownHandlers({
       ]);
       logger.app("lifecycle", "info", "app shutdown");
       await pluginSurfacesShutdown;
+      // Stop browser ingress before disposing the desktop's shared Host.
+      await getActiveMobileCompanion()?.close();
+      setActiveMobileCompanion(null);
       const hostShutdown = getHost()?.dispose();
       const mcpShutdown = getMcpControl()?.stop();
       updater.dispose();

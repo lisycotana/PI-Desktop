@@ -10,7 +10,13 @@
  * Register with:
  *   register(pathToFileURL(join(here, "helpers/ts-import-hooks.mjs")));
  */
+import { readFile } from "node:fs/promises";
+
 export async function resolve(specifier, context, next) {
+  if (specifier.endsWith("?raw")) {
+    const resolved = await next(specifier.slice(0, -4), context);
+    return { ...resolved, url: resolved.url + "?raw" };
+  }
   if (!specifier.startsWith("./") && !specifier.startsWith("../")) {
     return next(specifier, context);
   }
@@ -25,4 +31,17 @@ export async function resolve(specifier, context, next) {
     if (typescript === null) throw error;
     return next(typescript, context);
   }
+}
+
+export async function load(url, context, next) {
+  if (url.endsWith("?raw")) {
+    return { format: "module", source: `export default ${JSON.stringify(await readFile(new URL(url), "utf8"))};`, shortCircuit: true };
+  }
+  if (url.endsWith(".tsx")) {
+    const ts = await import("typescript");
+    const source = await readFile(new URL(url), "utf8");
+    const result = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 }, fileName: new URL(url).pathname });
+    return { format: "module", source: result.outputText, shortCircuit: true };
+  }
+  return next(url, context);
 }

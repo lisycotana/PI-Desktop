@@ -1,0 +1,51 @@
+@import "../styles/globals.css";
+
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+.mobile-native-app { height: var(--mobile-viewport-height, 100dvh); display: flex; flex-direction: column; color: var(--ds-text-primary); background: var(--ds-bg-primary); }
+.mobile-native-header { height: 44px; flex: 0 0 44px; display: flex; align-items: center; gap: 8px; padding: env(safe-area-inset-top) 10px 0; }
+.mobile-native-header h1 { min-width: 0; flex: 1; font-size: var(--text-base); font-weight: var(--font-weight-semibold); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.mobile-native-connection { width: 6px; height: 6px; border-radius: var(--radius-round); background: var(--ds-text-muted); }
+.mobile-native-connection[data-status="connected"] { background: var(--ds-success); }
+.mobile-native-chat, .mobile-native-surface { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+.mobile-native-app .chat-surface { height: 100%; min-height: 0; min-width: 0; width: 100%; }
+.mobile-native-hidden { display: none; }
+.mobile-native-home { flex: 1; overflow: auto; padding: 12px; }
+.mobile-native-sessions { display: flex; flex-direction: column; gap: 4px; padding: 12px 0; }
+.mobile-native-sessions > button { justify-content: flex-start; text-align: start; min-height: 44px; }
+.mobile-native-error { padding: 6px 12px; margin: 0; font-size: var(--text-sm); color: var(--ds-error); }
+.mobile-native-review { flex: 1; min-height: 0; overflow: auto; }
+.mobile-native-working-changes { padding: 12px; }
+.mobile-native-working-changes pre { overflow: auto; max-height: 50dvh; font-size: var(--text-sm); }
+.mobile-native-panel { position: absolute; inset: 44px 0 0; z-index: 50; display: flex; flex-direction: column; background: var(--ds-bg-primary); overflow: auto; }
+.mobile-native-panel > header { display: flex; justify-content: flex-end; padding: 6px 12px; flex: 0 0 auto; }
+.mobile-native-pair { width: min(100%, 380px); margin: auto; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.mobile-native-pair form { width: 100%; display: grid; gap: 12px; }
+.mobile-native-pair h1 { font-size: var(--text-xl); font-weight: var(--font-weight-semibold); }
+.mobile-native-pair video { width: 100%; border-radius: var(--radius-md); }
+.mobile-native-verification { font-size: var(--text-2xl); letter-spacing: var(--tracking-wide); font-variant-numeric: tabular-nums; }
+.mobile-native-app .conversation-width-handles { display: none; }
+.mobile-native-app .composer-dock-docked { padding: 0 10px max(10px, env(safe-area-inset-bottom)); }
+.mobile-native-app .composer-stack { max-width: 100%; }
+.mobile-native-app .home-composer-wrap { padding: 0 10px max(10px, env(safe-area-inset-bottom)); }
+.mobile-native-app .home-main-content { padding-inline: 0; }
+.mobile-native-app .thread-scroll { padding-inline: 12px; }
+.mobile-native-app .permission-card-actions { flex-wrap: wrap; gap: 8px; }
+.mobile-native-app .send-btn, .mobile-native-app .stop-btn { width: 36px; height: 36px; min-width: 36px; min-height: 36px; flex: 0 0 36px; aspect-ratio: 1; border-radius: var(--radius-round); padding: 0; }
+.mobile-native-app .composer-toolbar { flex-wrap: wrap; row-gap: 6px; }
+.mobile-native-app .composer-left, .mobile-native-app .composer-right { min-width: 0; }
+.mobile-native-app .composer-input { font-size: var(--text-lg); }
+.mobile-native-app .subagent-topology { overflow-x: auto; }
+.mobile-native-app .home-scroll { padding: 20px 12px; }
+@media (max-width: 600px) {
+  .mobile-native-app .composer-toolbar { padding-inline: 6px; }
+  .mobile-native-app .composer-left { flex: 1 0 100%; }
+  .mobile-native-app .composer-right { flex: 1 0 100%; justify-content: flex-end; }
+  .mobile-native-app .composer-model-thinking { flex: 1; }
+  .mobile-native-app .composer-right .composer-model-thinking-chip { width: 100%; max-width: 100%; flex: 1 1 auto; padding: 0 6px !important; gap: 4px !important; }
+  .mobile-native-app .composer-model-thinking-model { display: inline; max-width: 130px; }
+  .mobile-native-app .composer-model-thinking-chevron, .mobile-native-app .composer-model-thinking-dot, .mobile-native-app .composer-model-thinking-level, .mobile-native-app .context-inspector-ring-value { display: inline; }
+  .mobile-native-app .composer-right .context-inspector-trigger { gap: 4px; padding-inline: 4px; }
+  .mobile-native-app .permission-card { padding: 14px; }
+  .mobile-native-app .tool-detail-block pre { max-width: 100%; overflow-x: auto; }
+  .mobile-native-app .thread-content { max-width: 100%; }
+}

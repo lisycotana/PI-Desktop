@@ -122,11 +122,21 @@ describe("RACP-WS turns, events, and approvals", () => {
     const h = await harness();
     const { client } = await h.connect(OWNER_TOKEN);
     await client.request("session/attach", { sessionId: "s1" });
-    const first = await client.request<{ turn: RacpTurn }>("turn/start", { sessionId: "s1", input: { text: "hello" }, context: context("r1", "same") });
-    const second = await client.request<{ turn: RacpTurn }>("turn/start", { sessionId: "s1", input: { text: "hello" }, context: context("r2", "same") });
+    const first = await client.request<{ turn: RacpTurn }>("turn/start", {
+      sessionId: "s1", permissionModeCeiling: "ask", input: { text: "hello" }, context: context("r1", "same"),
+    });
+    const second = await client.request<{ turn: RacpTurn }>("turn/start", {
+      sessionId: "s1", permissionModeCeiling: "ask", input: { text: "hello" }, context: context("r2", "same"),
+    });
     expect(second.turn.id).toBe(first.turn.id);
     expect(h.runtime.prompts).toHaveLength(1);
+    await expect(client.request("turn/start", {
+      sessionId: "s1", permissionModeCeiling: "auto", input: { text: "hello" }, context: context("r3", "same"),
+    })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
     await expect(client.request("turn/start", { sessionId: "s1", input: { text: "other" }, context: context("r3", "same") })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+    await expect(client.request("turn/start", {
+      sessionId: "s1", permissionModeCeiling: "unbounded", input: { text: "invalid" }, context: context("r3-invalid"),
+    })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
     await expect(client.request("turn/start", { sessionId: "s1", input: { text: "busy" }, context: context("r4") })).rejects.toMatchObject({ code: "AGENT_BUSY" });
     const queued = await client.request<{ turn: RacpTurn }>("turn/start", { sessionId: "s1", admission: "queue", input: { text: "later" }, context: context("r5") });
     expect(queued.turn.status).toBe("queued");

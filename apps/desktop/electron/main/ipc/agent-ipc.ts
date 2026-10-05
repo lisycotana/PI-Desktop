@@ -477,6 +477,7 @@ export function registerAgentIpc({
       providerId: launch.providerId,
       modelId: launch.modelId,
       ...(sessionMessage ? { sessionMessageId: sessionMessage.origin.messageId } : {}),
+      ...(req.permissionMode ? { permissionMode: req.permissionMode } : {}),
     });
     const durableTurnId = String(turn?.turnId ?? "").trim();
     if (!durableTurnId) {
@@ -688,10 +689,9 @@ export function registerAgentIpc({
             })),
           ],
           userMessageId: userMessage.id,
-          // Per-turn permission ceiling override (R1 leftover; spec §7.3). The
-          // sidecar records it on the turn context; enforcement of a NARROWER
-          // ceiling still routes through the session's stored mode until
-          // host-core `session.beginTurn` accepts the scoped param.
+          // Host-core enforces this mode from the durable turn boundary. Keep
+          // forwarding it for runtime observability and wire compatibility;
+          // the sidecar is not an approval authority.
           ...(req.permissionMode ? { permissionMode: req.permissionMode } : {}),
         },
       );

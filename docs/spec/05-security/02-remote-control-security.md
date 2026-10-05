@@ -250,6 +250,15 @@ withhold nothing. Its turns report the session's own mode as
 (default off) re-applies the ceiling to paired devices for an operator who
 wants every remote turn to start at `ask`.
 
+The effective value is enforced by host-core at the durable turn boundary,
+not by the provider runtime. It is a process-local turn scope, not a Session
+preference write. Both `tools.execute` and `permissions.evaluate` take the stricter of the scope and
+the current durable/default mode for every tool call. Completion, error,
+abort, truncation, and restart remove the scope; a late terminal event from an
+older turn cannot clear a newer turn's scope. Promoted queue entries may share
+a running turn only when their effective mode is at least as permissive as the
+running turn's mode; stricter entries retain their own queued turn boundary.
+
 `allow-session` is offered to a remote approver only when Host policy allows
 remote session grants; otherwise the request's `allowedDecisions` omit it. A
 session grant made remotely is the same by-tool-name grant as a local one

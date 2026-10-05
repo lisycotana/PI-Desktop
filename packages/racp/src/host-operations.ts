@@ -4,6 +4,7 @@ import type {
   FsReadResult,
   RacpProjectSummary,
   WorkspaceDiff,
+  AgentPromptAttachment,
 } from "@pi-desktop/shared";
 
 /**
@@ -86,4 +87,8 @@ export type RacpHostOperations = {
   terminal?: RacpTerminalAccess;
   /** Owner-only: revoke a paired device (spec `session/revoke`). */
   revokeDevice?: (deviceId: string) => Promise<boolean>;
+  /** Resolve browser-owned upload references into Host-safe attachments. */
+  attachments?: {
+    resolve(principal: Principal, sessionId: string, refs: unknown[]): Promise<AgentPromptAttachment[]>;
+  };
 };

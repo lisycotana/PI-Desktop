@@ -78,6 +78,50 @@ export type AgentHostOptions = {
   onQueueChange?: (sessionId: string, entries: QueueEntryView[]) => void;
 };
 
+/**
+ * Main-private authority created only after the trusted desktop approves one
+ * personal browser. It is deliberately separate from `Principal`: ordinary
+ * RACP devices cannot claim it in a wire payload, and it never turns a browser
+ * into an owner or paired device.
+ */
+export type PersonalBrowserAuthority = Readonly<{
+  kind: "personal-browser";
+  principalSubject: string;
+  maxPermissionMode: RacpPermissionMode;
+  allowSessionGrants: boolean;
+}>;
+
+function personalBrowserAuthorityApplies(
+  principal: Principal,
+  authority: PersonalBrowserAuthority | undefined,
+): authority is PersonalBrowserAuthority {
+  return authority?.kind === "personal-browser" &&
+    authority.principalSubject === principal.subject;
+}
+
+/**
+ * Project the decisions offered to one trusted personal browser. The broker's
+ * canonical request remains conservative for every other remote subscriber.
+ */
+export function projectApprovalForPersonalBrowser(
+  request: RacpApprovalRequest,
+  principal: Principal,
+  authority: PersonalBrowserAuthority | undefined,
+): RacpApprovalRequest {
+  if (
+    request.kind !== "tool" ||
+    !personalBrowserAuthorityApplies(principal, authority) ||
+    !authority.allowSessionGrants ||
+    request.allowedDecisions.includes("allow-session")
+  ) {
+    return request;
+  }
+  return {
+    ...request,
+    allowedDecisions: [...request.allowedDecisions, "allow-session"],
+  };
+}
+
 /** A queued turn together with the prompt it will send. */
 export type QueueEntryView = {
   turn: RacpTurn;
@@ -93,8 +137,12 @@ export type QueueEntryView = {
 export type StartTurnParams = {
   sessionId: string;
   idempotencyKey?: string;
+  /** Optional caller-selected cap for this turn; it cannot widen Host policy. */
+  permissionModeCeiling?: RacpPermissionMode;
   /** Main-private identity captured when authorizing a Live work scope. */
   expectedWorkspaceIdentity?: string | null;
+  /** Main validates this against the current transcript before admission. */
+  truncateFromMessageId?: string;
   admission?: RacpTurnAdmission;
   input: {
     text: string;
@@ -460,15 +508,52 @@ export class AgentHost {
     this.hub.ack(subscriptionId, sequence);
   }
 
-  async startTurn(principal: Principal, params: StartTurnParams): Promise<StartTurnResult> {
+  async startTurn(
+    principal: Principal,
+    params: StartTurnParams,
+    authority?: PersonalBrowserAuthority,
+  ): Promise<StartTurnResult> {
     this.requireRole(principal, "turn/start");
-    return this.withAdmission(params.sessionId, () => this.startTurnAdmitted(principal, params));
+    return this.withAdmission(params.sessionId, () =>
+      this.startTurnAdmitted(principal, params, false, authority));
+  }
+
+  /**
+   * Reserve an idle session for deletion. Admission is acquired before the
+   * runtime exclusion so turn starts cannot invert the lock order, and the
+   * second idle check closes the window while that runtime exclusion waited.
+   */
+  async withSessionDeletion<T>(
+    sessionId: string,
+    acquireRuntimeExclusion: () => Promise<() => void>,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.withAdmission(sessionId, async () => {
+      const requireIdle = () => {
+        if (this.isBusy(this.state(sessionId))) {
+          throw racpError("AGENT_BUSY", "the session has active or queued work");
+        }
+      };
+      requireIdle();
+      const releaseRuntimeExclusion = await acquireRuntimeExclusion();
+      try {
+        requireIdle();
+        return await operation();
+      } finally {
+        releaseRuntimeExclusion();
+      }
+    });
   }
 
   /** Append to the shared Host queue even when no turn is currently running. */
-  async enqueueTurn(principal: Principal, params: StartTurnParams): Promise<StartTurnResult> {
+  async enqueueTurn(
+    principal: Principal,
+    params: StartTurnParams,
+    authority?: PersonalBrowserAuthority,
+  ): Promise<StartTurnResult> {
     this.requireRole(principal, "turn/start");
-    const result = await this.withAdmission(params.sessionId, () => this.startTurnAdmitted(principal, params, true));
+    const result = await this.withAdmission(params.sessionId, () =>
+      this.startTurnAdmitted(principal, params, true, authority));
     await this.drain(params.sessionId);
     return {
       ...result,
@@ -481,6 +566,7 @@ export class AgentHost {
     principal: Principal,
     params: StartTurnParams,
     forceQueue = false,
+    authority?: PersonalBrowserAuthority,
   ): Promise<StartTurnResult> {
     const summary = await this.requireSession(params.sessionId);
     if (
@@ -491,7 +577,7 @@ export class AgentHost {
     }
     const state = this.state(summary.id);
     state.permissionMode = summary.permissionMode;
-    const inputHash = hashInput(params.input);
+    const inputHash = hashInput(params.input, params.permissionModeCeiling);
     const idempotencyKey = params.idempotencyKey ?? params.context.idempotencyKey;
     if (idempotencyKey) {
       const remembered = this.idempotency.get(`${principal.subject}|${idempotencyKey}`);
@@ -509,14 +595,23 @@ export class AgentHost {
         details: { expectedRevision: expected, revision: state.revision },
       });
     }
+    const personalBrowserAuthority = personalBrowserAuthorityApplies(principal, authority)
+      ? authority
+      : undefined;
     const effectivePermissionMode = effectiveRemotePermissionMode({
       sessionMode: summary.permissionMode,
-      policy: this.policy,
-      pairedDevice: principal.pairedDevice ?? false,
-      approverOverride: principal.approverOverride ?? false,
+      policy: personalBrowserAuthority
+        ? { ...this.policy, remoteMaxPermissionMode: personalBrowserAuthority.maxPermissionMode }
+        : this.policy,
+      pairedDevice: personalBrowserAuthority ? false : (principal.pairedDevice ?? false),
+      approverOverride: personalBrowserAuthority ? false : (principal.approverOverride ?? false),
+      requestedCeiling: params.permissionModeCeiling,
     });
     const admission: RacpTurnAdmission = forceQueue ? "queue" : params.admission ?? "reject_if_busy";
     const busy = this.isBusy(state);
+    if (params.truncateFromMessageId && (busy || forceQueue)) {
+      throw racpError("AGENT_BUSY", "history edits require an idle session");
+    }
     let turn: TurnRecord;
     if (busy || forceQueue) {
       if (admission === "reject_if_busy") {
@@ -550,6 +645,7 @@ export class AgentHost {
       const started = await this.runtime.prompt({
         sessionId: state.id,
         content: params.input.text,
+        ...(params.truncateFromMessageId ? { truncateFromMessageId: params.truncateFromMessageId } : {}),
         ...(params.input.sessionMessageId ? { sessionMessageId: params.input.sessionMessageId } : {}),
         ...(params.input.userMessageId ? { userMessageId: params.input.userMessageId } : {}),
         ...(params.input.voiceOrigin ? { voiceOrigin: params.input.voiceOrigin } : {}),
@@ -752,16 +848,33 @@ export class AgentHost {
     void this.drain(state.id);
   }
 
-  async respondApproval(principal: Principal, response: RacpApprovalResponse): Promise<RacpApprovalResult> {
+  async respondApproval(
+    principal: Principal,
+    response: RacpApprovalResponse,
+    authority?: PersonalBrowserAuthority,
+  ): Promise<RacpApprovalResult> {
     this.requireRole(principal, "approval/respond");
     const request = this.approvals.get(response.approvalId);
     const remembered = this.approvals.result(response.approvalId);
     if (!request && !remembered) throw racpError("NOT_FOUND", `approval ${response.approvalId} is not open`);
     const state = this.state((request ?? { sessionId: this.sessionOfResult(response.approvalId) }).sessionId);
-    if (response.decision === "allow-session" && !this.allowRemoteSessionGrants && !principal.pairedDevice) {
+    const personalBrowserSessionGrant =
+      personalBrowserAuthorityApplies(principal, authority) &&
+      authority.allowSessionGrants;
+    if (
+      response.decision === "allow-session" &&
+      !this.allowRemoteSessionGrants &&
+      !principal.pairedDevice &&
+      !personalBrowserSessionGrant
+    ) {
       throw racpError("FORBIDDEN", "remote session grants are not allowed by Host policy");
     }
-    const result = await this.approvals.resolve(response, principal, state.revision + 1);
+    const result = await this.approvals.resolve(
+      response,
+      principal,
+      state.revision + 1,
+      { allowSessionGrant: personalBrowserSessionGrant },
+    );
     if (!result.alreadyResolved) {
       this.afterApproval(state, request?.turnId);
       this.emit(state, "approval.resolved", result, { turnId: request?.turnId });
@@ -1057,6 +1170,14 @@ export class AgentHost {
         if (!record || record.priority === undefined) return undefined;
         const active = state.activeTurnId ? state.turns.get(state.activeTurnId) : undefined;
         if (!active || active.runtimeTurnId !== runtimeTurnId) return undefined;
+        // Steering joins the already-running permission context. Never fold a
+        // stricter queued input into a wider turn (for example, remote Ask
+        // into desktop Auto); keep it queued so it receives its own scoped
+        // Host turn at the next boundary.
+        if (
+          permissionModeRank(record.effectivePermissionMode) <
+          permissionModeRank(active.effectivePermissionMode ?? state.permissionMode)
+        ) return undefined;
         const turn = this.ensureTurn(state, record.id);
         if (turn.deliveryPending || turn.deliveredIntoTurnId) return undefined;
         turn.deliveryPending = true;
@@ -1472,7 +1593,11 @@ function isActive(status: RacpTurn["status"]): boolean {
   return RACP_ACTIVE_TURN_STATUSES.includes(status);
 }
 
-/** A turn that can no longer change: canceled or settled by its own run. */
+/** Compare a queued request ceiling with the active turn before steering. */
+function permissionModeRank(mode: RacpPermissionMode): number {
+  return mode === "ask" ? 0 : mode === "accept-edits" ? 1 : 2;
+}
+
 function isTerminal(status: TurnRecord["status"]): boolean {
   return !isActive(status) && status !== "queued";
 }
@@ -1512,10 +1637,14 @@ function requireSessionId(sessionId: string | undefined): string {
 }
 
 /** Small stable hash so a reused idempotency key with other input is detected. */
-export function hashInput(input: StartTurnParams["input"]): string {
+export function hashInput(
+  input: StartTurnParams["input"],
+  permissionModeCeiling?: RacpPermissionMode,
+): string {
   const encoded = JSON.stringify({
     text: input.text,
     attachments: input.attachments ?? [],
+    permissionModeCeiling: permissionModeCeiling ?? null,
     ...(input.sessionMessageId ? { sessionMessageId: input.sessionMessageId } : {}),
   });
   let hash = 5381;

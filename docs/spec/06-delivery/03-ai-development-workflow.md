@@ -16,15 +16,16 @@ The rules below govern every change to the PI-Desktop codebase and documentation
 
 - Every code, config, or UX change that alters observable behavior must update the relevant `docs/spec/` document before or alongside the change.
 - Architectural boundary changes (process model, IPC contract, storage ownership, security boundary) also require an ADR — see `docs/adr/README.md`.
-- Pure refactor that preserves behavior and API contracts does not require spec updates, but must still be committed (R2).
+- Pure refactor that preserves behavior and API contracts does not require spec updates; commits follow user authorization (R2).
 
-### R2 — Commit-per-change
+### R2 — User-authorized commits
 
-> **Every completed logical change must be git committed.**
+> **Commit only when the user asks, as required by AGENTS.md §17.**
 
-- No large uncommitted piles of work. Each logical unit of work — a feature, a fix, a spec update, a chore — gets its own commit.
-- Uncommitted work at session end is a violation of this rule.
-- If a change is incomplete, either commit it as a draft with a `WIP:` prefix or roll it back.
+- Keep each logical unit reviewable in the dedicated request worktree.
+- Uncommitted work is preserved when commit authorization is absent.
+- When authorized, stage explicit paths and use the repository's subject/body
+  format. Do not infer authorization from completion or discard unfinished work.
 
 ### R3 — E2E coverage doc
 
@@ -595,7 +596,7 @@ D164, and D260. GitHub release notes are not a substitute.
 | Practice | Why |
 |---|---|
 | Committing secrets | Security violation |
-| Large uncommitted diffs | Violates R2; loss of granularity |
+| Unreviewable diffs | Loss of granularity; keep units reviewable while awaiting commit authorization |
 | Changing behavior without spec update | Violates R1; specs become unreliable |
 | Skipping e2e doc for user-visible changes | Violates R3; traceability gap |
 | Declaring a code-bearing change complete without successful relevant E2E after incorporating latest `origin/main` | Violates R7 and leaves cross-process behavior unverified |

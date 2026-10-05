@@ -252,6 +252,7 @@ export function registerIpcHandlers(dependencies: RegisterIpcDependencies) {
     registrar,
     getHost,
     getSidecar,
+    getAgentHostBridge,
     dataDir,
     activeTurns,
     sessionProjects,

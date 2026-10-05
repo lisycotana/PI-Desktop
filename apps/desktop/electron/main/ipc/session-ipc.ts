@@ -21,6 +21,7 @@ import {
   type ExternalSource,
 } from "../importers";
 import type { AgentSidecar } from "../agent-sidecar";
+import type { AgentHostBridge } from "../agent-host-bridge";
 import type { HostProcess } from "../host-process";
 import type { Logger } from "../logger";
 import type { PersistenceOutbox } from "../persistence-outbox";
@@ -89,6 +90,7 @@ export type SessionIpcDependencies = {
   registrar: IpcRegistrar;
   getHost: () => HostProcess | null;
   getSidecar: () => AgentSidecar | null;
+  getAgentHostBridge: () => AgentHostBridge | null;
   dataDir: string;
   activeTurns: ReadonlyMap<string, string>;
   sessionProjects: Map<string, string | null>;
@@ -105,6 +107,7 @@ export function registerSessionIpc({
   registrar,
   getHost,
   getSidecar,
+  getAgentHostBridge,
   dataDir,
   activeTurns,
   sessionProjects,
@@ -332,20 +335,30 @@ export function registerSessionIpc({
       });
     }
     if (!host) throw new Error("host unavailable");
-    const res = await host.call("session.delete", { id });
-    await persistenceOutbox.dropSession(id);
-    // Drop the session's pi-agent so a later session with the same id (or a
-    // stale runtime) can't answer with this session's context.
-    if (sidecar) {
-      sidecar.clearProjectInstructionRoot(id);
-      sidecar.clearVendorAuthBindings(id);
-      await sidecar
-        .call("agent.disposeSession", { sessionId: id })
-        .catch(() => undefined);
-    }
-    sessionProjects.delete(id);
-    logger.app("session", "info", "session deleted", { sessionId: id });
-    return res;
+    const deletingHost = host;
+    const deletingSidecar = sidecar;
+    const agentHostBridge = getAgentHostBridge();
+    if (!agentHostBridge) throw new Error("agent host unavailable");
+    return agentHostBridge.withSessionDeletion(
+      id,
+      () => acquireSessionOperation(id),
+      async () => {
+        const res = await deletingHost.call("session.delete", { id });
+        await persistenceOutbox.dropSession(id);
+        // Drop the session's pi-agent so a later session with the same id (or a
+        // stale runtime) can't answer with this session's context.
+        if (deletingSidecar) {
+          deletingSidecar.clearProjectInstructionRoot(id);
+          deletingSidecar.clearVendorAuthBindings(id);
+          await deletingSidecar
+            .call("agent.disposeSession", { sessionId: id })
+            .catch(() => undefined);
+        }
+        sessionProjects.delete(id);
+        logger.app("session", "info", "session deleted", { sessionId: id });
+        return res;
+      },
+    );
   });
   handle(IPC.invoke.sessionRename, async (id: string, title: string) => {
     if (id.startsWith("native-pi:")) {

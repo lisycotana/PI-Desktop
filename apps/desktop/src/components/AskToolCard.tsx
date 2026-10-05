@@ -3,30 +3,12 @@ import { useTranslation } from "react-i18next";
 import {
   askToolOptionDescription,
   askToolOptionLabel,
-  type AskToolQuestion,
 } from "@pi-desktop/shared";
 import { AskToolRichText } from "./AskToolRichText";
+import { CUSTOM_OPTION, currentValues, draftAnswers, emptyDrafts, type DraftAnswer } from "../lib/asktool-answer-state";
 import type { PendingAsk } from "../lib/pending-asks";
 import { useAppStore } from "../stores/app-store";
 import { Button } from "./ui";
-
-type DraftAnswer = {
-  values: string[];
-  customSelected: boolean;
-  customText: string;
-  skipped: boolean;
-};
-
-const CUSTOM_OPTION = "__asktool_custom__";
-
-function emptyDrafts(questions: AskToolQuestion[]): DraftAnswer[] {
-  return questions.map(() => ({
-    values: [],
-    customSelected: false,
-    customText: "",
-    skipped: false,
-  }));
-}
 
 export function AskToolCard({ request, queued = 0 }: { request: PendingAsk; queued?: number }) {
   const { t } = useTranslation();
@@ -37,13 +19,6 @@ export function AskToolCard({ request, queued = 0 }: { request: PendingAsk; queu
   const [resolving, setResolving] = useState(false);
   const current = request.questions[index];
   const currentDraft = drafts[index];
-
-  const currentValues = (draft: DraftAnswer): string[] => [
-    ...draft.values,
-    ...(draft.customSelected && draft.customText.trim()
-      ? [draft.customText.trim()]
-      : []),
-  ];
 
   const statuses = useMemo(
     () =>
@@ -83,12 +58,6 @@ export function AskToolCard({ request, queued = 0 }: { request: PendingAsk; queu
     });
   };
 
-  const answers = (nextDrafts = drafts): Array<string[] | null> =>
-    nextDrafts.map((draft) => {
-      const values = currentValues(draft);
-      return values.length > 0 && !draft.skipped ? values : null;
-    });
-
   const submit = async (
     nextDrafts = drafts,
     explicitAnswers?: Array<string[] | null>,
@@ -99,7 +68,7 @@ export function AskToolCard({ request, queued = 0 }: { request: PendingAsk; queu
       await resolveAsk(request.sessionId, {
         requestId: request.requestId,
         sessionId: request.sessionId,
-        answers: explicitAnswers ?? answers(nextDrafts),
+        answers: explicitAnswers ?? draftAnswers(nextDrafts),
       });
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error), { variant: "error" });

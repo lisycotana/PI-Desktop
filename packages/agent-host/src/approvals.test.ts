@@ -96,6 +96,44 @@ describe("ApprovalBroker", () => {
     expect(port.tool).toEqual([]);
   });
 
+  it("accepts an unoffered session grant only with trusted internal authority", async () => {
+    const port = new FakeApprovalPort();
+    const broker = new ApprovalBroker(port, new FixedClock());
+    broker.fromToolPermission(toolRequest, {
+      turnId: "t1",
+      revision: 3,
+      lifetimeMs: 1_000,
+      allowSession: false,
+    });
+    const result = await broker.resolve(
+      { approvalId: "req_1", decision: "allow-session", context: { requestId: "personal-browser" } },
+      principal,
+      4,
+      { allowSessionGrant: true },
+    );
+    expect(result).toMatchObject({ status: "resolved", decision: "allow-session" });
+    expect(port.tool).toEqual([{ requestId: "req_1", decision: "allow-session" }]);
+  });
+
+  it("does not apply tool grant authority to contract approvals", async () => {
+    const port = new FakeApprovalPort();
+    const broker = new ApprovalBroker(port, new FixedClock());
+    broker.fromPlanningState({
+      sessionId: "s1",
+      state: "awaiting_approval",
+      kind: "plan",
+      proposalId: "prop_1",
+      version: 1,
+    }, { turnId: "t1", revision: 1, lifetimeMs: 1_000 });
+    await expect(broker.resolve(
+      { approvalId: "prop_1", decision: "allow-session", context: { requestId: "wrong-kind" } },
+      principal,
+      2,
+      { allowSessionGrant: true },
+    )).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(port.contract).toEqual([]);
+  });
+
   it("turns an awaiting_approval planning state into a contract approval that needs a mode", async () => {
     const port = new FakeApprovalPort();
     const broker = new ApprovalBroker(port, new FixedClock());

@@ -34,7 +34,7 @@ function gitListFiles(root: string): Promise<string[] | null> {
   return new Promise((resolve) => {
     const child = spawn(
       "git",
-      ["ls-files", "-co", "--exclude-standard", "-z"],
+      ["-c", "core.fsmonitor=false", "ls-files", "-co", "--exclude-standard", "-z"],
       { cwd: root, env: process.env },
     );
     let out = "";

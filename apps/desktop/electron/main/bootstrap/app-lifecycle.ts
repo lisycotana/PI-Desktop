@@ -22,6 +22,7 @@ import { isWindowFullScreen, setWindowFullScreen } from "../window-fullscreen";
 import { createTraySessions } from "../tray-sessions";
 import { createTaskbarUnreadBadge } from "../taskbar-unread-badge";
 import { createWindow, type WindowLifecycleState } from "./window";
+import { getActiveMobileCompanion } from "./mobile-companion";
 import { windowToggleAction } from "./window-visibility";
 import type { BrowserHost } from "../browser-host";
 import type { Logger } from "../logger";
@@ -242,6 +243,7 @@ export function createApplicationLifecycle({
     state.tray.setContextMenu(
       Menu.buildFromTemplate([
         ...template,
+        ...(process.env.PI_DESKTOP_MOBILE_ORIGIN ? [{type:"separator" as const},{label:resolveLocale(locale).startsWith("zh") ? "配对手机" : "Pair a phone",click:() => {void getActiveMobileCompanion()?.showPairing().catch(() => logger.app("runtime","warn","mobile pairing UI failed"));}},{label:resolveLocale(locale).startsWith("zh") ? "已连接的手机" : "Connected browsers",click:() => {void getActiveMobileCompanion()?.showSessions().catch(() => logger.app("runtime","warn","mobile browser list UI failed"));}}] : []),
         { type: "separator" },
         { label: labels.quit, click: () => app.quit() },
       ]),

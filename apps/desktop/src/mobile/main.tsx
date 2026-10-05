@@ -1,0 +1,30 @@
+import { createRoot } from "react-dom/client";
+import i18n from "i18next";
+import { initReactI18next } from "react-i18next";
+import { flattenCatalog } from "@pi-desktop/i18n/locale-info";
+import { en } from "@pi-desktop/i18n/locales/en";
+import { zhCN } from "@pi-desktop/i18n/locales/zh-CN";
+import { installBrowserBridge } from "./browser-bridge";
+import { installScrollbarReveal } from "../lib/scrollbar-reveal";
+import { mobileEn, mobileZh } from "./locales";
+import "./browser.css";
+
+const initialLink=location.hash?location.href:"";
+if(initialLink)history.replaceState(null,"",location.pathname+location.search);
+installBrowserBridge();
+document.documentElement.dataset.platform="linux";
+const theme=matchMedia("(prefers-color-scheme:light)");
+const applyTheme=()=>{document.documentElement.dataset.theme=theme.matches?"light":"dark";};applyTheme();theme.addEventListener("change",applyTheme);
+installScrollbarReveal(document);
+await i18n.use(initReactI18next).init({lng:navigator.language.toLowerCase().startsWith("zh")?"zh-CN":"en",fallbackLng:"en",resources:{en:{translation:{...flattenCatalog(en),...mobileEn}},"zh-CN":{translation:{...flattenCatalog(zhCN),...mobileZh}}},interpolation:{escapeValue:false},keySeparator:false});
+const { BrowserApp }=await import("./BrowserApp");
+const root=createRoot(document.getElementById("root")!);
+const show=(link:string)=>root.render(<BrowserApp key={link} initialLink={link}/>);
+show(initialLink);
+window.addEventListener("hashchange",()=>{
+  if(!location.hash)return;
+  const link=location.href;
+  history.replaceState(null,"",location.pathname+location.search);
+  show(link);
+});
+if("serviceWorker" in navigator)void navigator.serviceWorker.register("/sw.js");

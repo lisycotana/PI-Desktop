@@ -201,3 +201,6 @@ export function formatToolDuration(totalSeconds: number) {
 
   return parts.join(" ");
 }
+
+// The mobile shell ships these pure helpers with ToolRow's display functions.
+export { SUMMARY_KEYS as toolSummaryKeys, bareToolName, compact, summaryText };

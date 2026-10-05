@@ -38,6 +38,8 @@ export type TurnStartRequest = {
   sessionMessageId?: string;
   /** Client-chosen id for the durable user row (D288); the runtime mints one otherwise. */
   userMessageId?: string;
+  /** Validated, Main-private history edit; never accepted by the RACP wire schema. */
+  truncateFromMessageId?: string;
   voiceOrigin?: VoiceOrigin;
   attachments?: AgentPromptAttachment[];
   effectivePermissionMode: RacpPermissionMode;

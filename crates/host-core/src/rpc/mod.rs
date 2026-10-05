@@ -582,6 +582,61 @@ fn rpc_err(code: i64, message: impl Into<String>, error_code: &str) -> JsonRpcEr
     }
 }
 
+fn permission_mode_rank(mode: &str) -> Option<u8> {
+    match mode {
+        "ask" => Some(0),
+        "accept-edits" => Some(1),
+        "auto" => Some(2),
+        _ => None,
+    }
+}
+
+/// Return the live session mode and current durable/default permission mode.
+/// The latter is re-read for every tool decision so a desktop change to a
+/// stricter mode takes effect even while a scoped remote turn is running.
+fn session_permission_context(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(String, String), JsonRpcError> {
+    let Some(session_mode) = sessions::session_mode(&state.db, session_id)
+        .map_err(|error| rpc_err(1000, error.to_string(), "INTERNAL"))?
+    else {
+        return Err(rpc_err(1007, "session not found", "SESSION_NOT_FOUND"));
+    };
+    let session_permission_mode = sessions::session_permission_mode(&state.db, session_id)
+        .map_err(|error| rpc_err(1000, error.to_string(), "INTERNAL"))?
+        .filter(|value| value != "inherit");
+    let effective_permission_mode = session_permission_mode
+        .or_else(|| {
+            state
+                .db
+                .get_setting("app")
+                .ok()
+                .flatten()
+                .and_then(|settings| {
+                    settings
+                        .get("defaultPermissionMode")
+                        .and_then(Value::as_str)
+                        .filter(|value| {
+                            sessions::is_valid_permission_mode(value) && *value != "inherit"
+                        })
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| "ask".into());
+    Ok((session_mode, effective_permission_mode))
+}
+
+fn narrower_permission_mode<'a>(left: &'a str, right: &'a str) -> &'a str {
+    let left_rank = permission_mode_rank(left).unwrap_or(0);
+    let right_rank = permission_mode_rank(right).unwrap_or(0);
+    if left_rank <= right_rank {
+        left
+    } else {
+        right
+    }
+}
+
 fn config_sync_rpc_err(error: impl ToString) -> JsonRpcError {
     let message = error.to_string();
     let error_code = message
@@ -2584,11 +2639,12 @@ async fn handle_request(
                 .get("id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| rpc_err(1002, "id required", "INVALID_PARAMS"))?;
-            let st = state.lock().await;
+            let mut st = state.lock().await;
             let ok = sessions::delete_session(&st.db, id)
                 .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
             if ok {
                 drop_session_side_data(&st, id);
+                st.clear_session_permission_scope(id);
             }
             Ok(json!({ "ok": ok }))
         }
@@ -2702,7 +2758,7 @@ async fn handle_request(
                 .map(str::trim)
                 .filter(|id| !id.is_empty());
             let truncate_before = params.get("truncateBefore").and_then(|v| v.as_i64());
-            let st = state.lock().await;
+            let mut st = state.lock().await;
             let truncated =
                 sessions::truncate_from(&st.db, session_id, from_message_id, truncate_before)
                     .map_err(|e| {
@@ -2715,6 +2771,9 @@ async fn handle_request(
                             rpc_err(1000, message, "INTERNAL")
                         }
                     })?;
+            if let Some(turn_id) = truncated.aborted_turn_id.as_deref() {
+                st.clear_turn_permission_scope(session_id, turn_id);
+            }
             serde_json::to_value(truncated).map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))
         }
 
@@ -2948,7 +3007,32 @@ async fn handle_request(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| rpc_err(1002, "sessionId required", "INVALID_PARAMS"))?;
-            let st = state.lock().await;
+            let requested_permission_mode = params
+                .get("permissionMode")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|mode| permission_mode_rank(mode).is_some())
+                        .ok_or_else(|| {
+                            rpc_err(
+                                1002,
+                                "permissionMode must be ask, accept-edits, or auto",
+                                "INVALID_PARAMS",
+                            )
+                        })
+                })
+                .transpose()?;
+            let mut st = state.lock().await;
+            if let Some(requested) = requested_permission_mode {
+                let (_, current) = session_permission_context(&st, session_id)?;
+                if permission_mode_rank(requested) > permission_mode_rank(&current) {
+                    return Err(rpc_err(
+                        1003,
+                        "per-turn permissionMode cannot widen the current session policy",
+                        "FORBIDDEN",
+                    ));
+                }
+            }
             let provider = params.get("providerId").and_then(Value::as_str);
             let model = params.get("modelId").and_then(Value::as_str);
             let turn_id = match params.get("sessionMessageId").and_then(Value::as_str) {
@@ -2958,6 +3042,15 @@ async fn handle_request(
                 None => sessions::begin_turn(&st.db, session_id, provider, model),
             }
             .map_err(session_collaboration_rpc_err)?;
+            if let Some(permission_mode) = requested_permission_mode {
+                // Install the scope only after durable admission succeeds. A
+                // failed AGENT_BUSY attempt must not disturb the running turn.
+                st.set_turn_permission_scope(session_id, &turn_id, permission_mode);
+            } else {
+                // A successful unscoped admission also supersedes any stale
+                // process-local scope left by an older, already-settled turn.
+                st.clear_session_permission_scope(session_id);
+            }
             Ok(json!({ "turnId": turn_id }))
         }
         "session.recordUsage" => {
@@ -2986,7 +3079,7 @@ async fn handle_request(
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("completed");
-            let st = state.lock().await;
+            let mut st = state.lock().await;
             let result = sessions::end_turn_settling(
                 &st.db,
                 turn_id,
@@ -3003,6 +3096,9 @@ async fn handle_request(
                     .unwrap_or(false),
             )
             .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?;
+            // Idempotent retries may report updated=false. Clearing is still
+            // correct for this exact turn, and cannot clear a newer scope.
+            st.clear_turn_permission_scope_by_turn(turn_id);
             let mut response = json!({ "ok": result.updated });
             if let Some(notification) = result.notification {
                 response["notification"] = json!(notification);
@@ -3682,6 +3778,20 @@ async fn handle_request(
                         }
                         _ => effective_pm,
                     };
+                    // Actual tool execution has its own permission path. The
+                    // Host-admitted turn ceiling constrains it too, including
+                    // subagent scopes and later changes to the durable policy.
+                    let effective_pm = if let Some(scope) = st.turn_permission_scope(&p.session_id)
+                    {
+                        let (_, current) = session_permission_context(&st, &p.session_id)?;
+                        narrower_permission_mode(
+                            narrower_permission_mode(&effective_pm, &current),
+                            &scope.permission_mode,
+                        )
+                        .to_string()
+                    } else {
+                        effective_pm
+                    };
                     // Resolve the tool root from the persisted session instead of
                     // the mutable global workspace. This keeps background turns
                     // isolated when the renderer switches between project tabs.
@@ -4191,31 +4301,14 @@ async fn handle_request(
                 })
                 .filter(|items: &Vec<String>| !items.is_empty());
             let st = state.lock().await;
-            let Some(mode) = sessions::session_mode(&st.db, session_id)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
-            else {
-                return Err(rpc_err(1007, "session not found", "SESSION_NOT_FOUND"));
-            };
-            let session_pm = sessions::session_permission_mode(&st.db, session_id)
-                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
-                .filter(|value| value != "inherit");
-            let effective_pm = session_pm
-                .or_else(|| {
-                    st.db
-                        .get_setting("app")
-                        .ok()
-                        .flatten()
-                        .and_then(|settings| {
-                            settings
-                                .get("defaultPermissionMode")
-                                .and_then(|value| value.as_str())
-                                .filter(|value| {
-                                    sessions::is_valid_permission_mode(value) && *value != "inherit"
-                                })
-                                .map(str::to_string)
-                        })
-                })
-                .unwrap_or_else(|| "ask".into());
+            let (mode, persisted_permission_mode) = session_permission_context(&st, session_id)?;
+            let scoped_permission_mode = st
+                .turn_permission_scope(session_id)
+                .map(|scope| scope.permission_mode.clone());
+            let effective_pm = scoped_permission_mode
+                .as_deref()
+                .map(|scoped| narrower_permission_mode(&persisted_permission_mode, scoped))
+                .unwrap_or(&persisted_permission_mode);
             let args = params.get("args").cloned().unwrap_or_else(|| json!({}));
             let workspace_path = resolve_tool_workspace_for_call(&st, session_id, &args)?;
             let scratch_path = scratch::session_dir(&st.data_dir, session_id);
@@ -4231,7 +4324,7 @@ async fn handle_request(
                     session_id,
                     tool_name,
                     mode: &mode,
-                    permission_mode: &effective_pm,
+                    permission_mode: effective_pm,
                     session_grants: &st.session_grants,
                     declared_risk,
                     requires_external_path_permission: external_path_permission,
@@ -5028,6 +5121,303 @@ mod tests {
         // A tool with no effective timeout keeps the old unbounded behavior.
         let read = json!({"toolName": "Read"});
         assert_eq!(request_budget_ms("tools.execute", &read), None);
+    }
+
+    #[tokio::test]
+    async fn per_turn_permission_scope_is_enforced_and_cleared_at_the_host_boundary() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let session_id = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                mode: Some("agent".into()),
+                permission_mode: Some("auto".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id;
+        let state = Arc::new(Mutex::new(app_state));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let baseline = handle_request(
+            state.clone(),
+            "permissions.evaluate",
+            json!({ "sessionId": session_id, "toolName": "Bash", "args": {} }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(baseline["decision"], "allow-once");
+
+        let started = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({ "sessionId": session_id, "permissionMode": "ask" }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let turn_id = started["turnId"].as_str().unwrap().to_string();
+
+        let narrowed = handle_request(
+            state.clone(),
+            "permissions.evaluate",
+            json!({ "sessionId": session_id, "toolName": "Bash", "args": {} }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(narrowed["decision"].is_null());
+        let busy = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({ "sessionId": session_id, "permissionMode": "ask" }),
+            tx.clone(),
+        )
+        .await
+        .expect_err("a failed admission must leave the running scope intact");
+        assert_eq!(busy.data.unwrap()["errorCode"], "AGENT_BUSY");
+        {
+            let st = state.lock().await;
+            assert_eq!(
+                sessions::session_permission_mode(&st.db, &session_id)
+                    .unwrap()
+                    .as_deref(),
+                Some("auto")
+            );
+            assert_eq!(
+                st.turn_permission_scope(&session_id)
+                    .map(|scope| (scope.turn_id.as_str(), scope.permission_mode.as_str())),
+                Some((turn_id.as_str(), "ask"))
+            );
+        }
+
+        handle_request(
+            state.clone(),
+            "session.endTurn",
+            json!({ "turnId": turn_id, "status": "completed" }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let after = handle_request(
+            state.clone(),
+            "permissions.evaluate",
+            json!({ "sessionId": session_id, "toolName": "Bash", "args": {} }),
+            tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(after["decision"], "allow-once");
+        assert!(state
+            .lock()
+            .await
+            .turn_permission_scope(&session_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn per_turn_permission_scope_gates_actual_write_execution_and_subagent_scope() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let project = data_dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let marker = project.join("approved.txt");
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let session_id = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                mode: Some("agent".into()),
+                permission_mode: Some("auto".into()),
+                project_path: Some(project.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id;
+        let state = Arc::new(Mutex::new(app_state));
+        let started = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({ "sessionId": session_id, "permissionMode": "ask" }),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        for (call_id, decision) in [("denied-write", "deny"), ("approved-write", "allow-once")] {
+            let request_state = state.clone();
+            let request_session = session_id.clone();
+            let path = marker.to_string_lossy().into_owned();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                handle_request(
+                    request_state,
+                    "tools.execute",
+                    json!({ "sessionId": request_session, "toolCallId": call_id,
+                        "toolName": "Write", "args": { "path": path, "content": "approved" },
+                        "mode": "agent", "permissionScope": "auto" }),
+                    tx,
+                )
+                .await
+            });
+            let notification = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an Auto session with an Ask turn must request approval")
+                .unwrap();
+            let notification: Value = serde_json::from_str(&notification).unwrap();
+            assert_eq!(notification["method"], "permissions.request");
+            assert!(!marker.exists(), "no bytes may be written before approval");
+            handle_request(
+                state.clone(),
+                "permissions.resolve",
+                json!({ "requestId": notification["params"]["requestId"], "decision": decision }),
+                mpsc::unbounded_channel().0,
+            )
+            .await
+            .unwrap();
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result["ok"], decision == "allow-once");
+            assert_eq!(marker.exists(), decision == "allow-once");
+        }
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "approved");
+        handle_request(
+            state.clone(),
+            "session.endTurn",
+            json!({ "turnId": started["turnId"], "status": "completed" }),
+            mpsc::unbounded_channel().0,
+        )
+        .await
+        .unwrap();
+        drop(state);
+        let restarted = AppState::open(data_dir.path()).unwrap();
+        assert!(restarted.turn_permission_scope(&session_id).is_none());
+        assert_eq!(
+            sessions::session_permission_mode(&restarted.db, &session_id)
+                .unwrap()
+                .as_deref(),
+            Some("auto")
+        );
+    }
+
+    #[tokio::test]
+    async fn per_turn_permission_scope_refuses_widening_before_turn_admission() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let session_id = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                permission_mode: Some("ask".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id;
+        let state = Arc::new(Mutex::new(app_state));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let widening = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({ "sessionId": session_id, "permissionMode": "auto" }),
+            tx.clone(),
+        )
+        .await
+        .expect_err("a per-turn scope must not widen the session policy");
+        assert_eq!(widening.code, 1003);
+        assert_eq!(widening.data.unwrap()["errorCode"], "FORBIDDEN");
+
+        let invalid = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({ "sessionId": session_id, "permissionMode": "inherit" }),
+            tx.clone(),
+        )
+        .await
+        .expect_err("inherit is not a concrete per-turn ceiling");
+        assert_eq!(invalid.data.unwrap()["errorCode"], "INVALID_PARAMS");
+
+        let admitted = handle_request(
+            state,
+            "session.beginTurn",
+            json!({ "sessionId": session_id, "permissionMode": "ask" }),
+            tx,
+        )
+        .await
+        .expect("rejected widening must not leave a running turn");
+        assert!(admitted["turnId"].is_string());
+    }
+
+    #[tokio::test]
+    async fn current_stricter_mode_wins_and_stale_end_cannot_clear_a_newer_scope() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut app_state = AppState::open(data_dir.path()).unwrap();
+        app_state.handshook = true;
+        let session_id = sessions::create_session_with_options(
+            &app_state.db,
+            sessions::SessionCreateOptions {
+                mode: Some("agent".into()),
+                permission_mode: Some("auto".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id;
+        let state = Arc::new(Mutex::new(app_state));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let started = handle_request(
+            state.clone(),
+            "session.beginTurn",
+            json!({ "sessionId": session_id, "permissionMode": "accept-edits" }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        let old_turn_id = started["turnId"].as_str().unwrap().to_string();
+
+        // Session configuration normally refuses mutation while a turn runs.
+        // Write the durable value directly to model another trusted writer or
+        // a future relaxed configure path; evaluation must still fail closed.
+        state
+            .lock()
+            .await
+            .db
+            .conn()
+            .execute(
+                "UPDATE sessions SET permission_mode = 'ask' WHERE id = ?1",
+                rusqlite::params![session_id],
+            )
+            .unwrap();
+        let stricter = handle_request(
+            state.clone(),
+            "permissions.evaluate",
+            json!({ "sessionId": session_id, "toolName": "Write", "args": {} }),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(stricter["decision"].is_null());
+
+        {
+            let mut st = state.lock().await;
+            st.set_turn_permission_scope(&session_id, "newer-turn", "ask");
+        }
+        handle_request(
+            state.clone(),
+            "session.endTurn",
+            json!({ "turnId": old_turn_id, "status": "aborted" }),
+            tx,
+        )
+        .await
+        .unwrap();
+        let st = state.lock().await;
+        assert_eq!(
+            st.turn_permission_scope(&session_id)
+                .map(|scope| scope.turn_id.as_str()),
+            Some("newer-turn")
+        );
     }
 
     #[test]

@@ -24,6 +24,12 @@ const PLUGIN_IMPORT_RATE_LIMIT: usize = 10;
 const PLUGIN_BATCH_IMPORT_RATE_LIMIT: usize = 5;
 const PLUGIN_DELETE_RATE_LIMIT: usize = 20;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnPermissionScope {
+    pub(crate) turn_id: String,
+    pub(crate) permission_mode: String,
+}
+
 pub struct AppState {
     pub data_dir: std::path::PathBuf,
     pub db: Database,
@@ -50,6 +56,10 @@ pub struct AppState {
     pub shutting_down: bool,
     /// session_id -> toolName grants
     pub session_grants: HashMap<String, Vec<String>>,
+    /// A caller may narrow one running turn below the persisted session mode.
+    /// This is process-local on purpose: orphan recovery aborts running turns
+    /// on restart, while the user's durable session preference stays intact.
+    turn_permission_scopes: HashMap<String, TurnPermissionScope>,
     /// executionId -> responder for plugin tool dispatches awaiting the
     /// desktop runner (Electron main executes the plugin JS and resolves).
     pub plugin_execs: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
@@ -141,6 +151,7 @@ impl AppState {
             handshook: false,
             shutting_down: false,
             session_grants: HashMap::new(),
+            turn_permission_scopes: HashMap::new(),
             plugin_execs: HashMap::new(),
             plugin_import_rates: HashMap::new(),
             plugin_batch_import_rates: HashMap::new(),
@@ -151,6 +162,58 @@ impl AppState {
             pending_bash_aborts: HashMap::new(),
             hashline: crate::tools::HashlineStore::new(),
         })
+    }
+
+    pub(crate) fn set_turn_permission_scope(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        permission_mode: &str,
+    ) {
+        self.turn_permission_scopes.insert(
+            session_id.to_string(),
+            TurnPermissionScope {
+                turn_id: turn_id.to_string(),
+                permission_mode: permission_mode.to_string(),
+            },
+        );
+    }
+
+    pub(crate) fn turn_permission_scope(&self, session_id: &str) -> Option<&TurnPermissionScope> {
+        self.turn_permission_scopes.get(session_id)
+    }
+
+    /// Clear only the scope owned by this turn. A late endTurn from an older
+    /// turn must not remove the ceiling of a newer turn in the same session.
+    pub(crate) fn clear_turn_permission_scope(&mut self, session_id: &str, turn_id: &str) -> bool {
+        if self
+            .turn_permission_scopes
+            .get(session_id)
+            .is_some_and(|scope| scope.turn_id == turn_id)
+        {
+            self.turn_permission_scopes.remove(session_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn clear_turn_permission_scope_by_turn(&mut self, turn_id: &str) -> bool {
+        let session_id = self
+            .turn_permission_scopes
+            .iter()
+            .find(|(_, scope)| scope.turn_id == turn_id)
+            .map(|(session_id, _)| session_id.clone());
+        if let Some(session_id) = session_id {
+            self.turn_permission_scopes.remove(&session_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn clear_session_permission_scope(&mut self, session_id: &str) {
+        self.turn_permission_scopes.remove(session_id);
     }
 
     fn rate_allowed(

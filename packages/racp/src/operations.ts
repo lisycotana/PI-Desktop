@@ -18,12 +18,14 @@ import type { DeviceTokenAuthenticator } from "./auth.js";
 import type { RacpHostOperations } from "./host-operations.js";
 import type { RacpConnection } from "./server.js";
 
+export type OperationConnection = Pick<RacpConnection, "id" | "auth" | "subscriptions" | "terminals">;
+
 export type OperationContext = {
-  connection: RacpConnection;
+  connection: OperationConnection;
   principal: Principal;
   agentHost: AgentHost;
   operations: RacpHostOperations;
-  authenticator: DeviceTokenAuthenticator;
+  authenticator: Pick<DeviceTokenAuthenticator, "pair">;
   limits: RacpLimits;
   capabilities: RacpServerCapabilities;
   traceId: string;
@@ -51,6 +53,11 @@ const SubscribeParams = Type.Object({
 const TurnStartParams = Type.Object({
   sessionId: Type.String({ minLength: 1 }),
   idempotencyKey: Type.Optional(Type.String({ minLength: 1 })),
+  permissionModeCeiling: Type.Optional(Type.Union([
+    Type.Literal("ask"),
+    Type.Literal("accept-edits"),
+    Type.Literal("auto"),
+  ])),
   admission: Type.Optional(Type.Union([Type.Literal("reject_if_busy"), Type.Literal("queue")])),
   input: Type.Object({
     text: Type.String(),
@@ -236,15 +243,19 @@ export function createOperations(): Map<RacpOperation, OperationHandler> {
     if (Buffer.byteLength(input.input.text, "utf8") > context.limits.maxPromptBytes) {
       throw new RacpError("PAYLOAD_TOO_LARGE", "prompt exceeds maxPromptBytes");
     }
-    if (input.input.attachments?.length) {
-      throw new RacpError("CAPABILITY_UNAVAILABLE", "attachments are not offered by this Host");
-    }
+    const attachments = input.input.attachments?.length
+      ? context.operations.attachments
+        ? await context.operations.attachments.resolve(context.principal, input.sessionId, input.input.attachments)
+        : (() => { throw new RacpError("CAPABILITY_UNAVAILABLE", "attachments are not offered by this Host"); })()
+      : undefined;
     return context.agentHost.startTurn(context.principal, {
       sessionId: input.sessionId,
       ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      ...(input.permissionModeCeiling ? { permissionModeCeiling: input.permissionModeCeiling } : {}),
       ...(input.admission ? { admission: input.admission } : {}),
       input: {
         text: input.input.text,
+        ...(attachments ? { attachments } : {}),
         ...(input.input.sessionMessageId ? { sessionMessageId: input.input.sessionMessageId } : {}),
         ...(input.input.messageId ? { userMessageId: input.input.messageId } : {}),
       },

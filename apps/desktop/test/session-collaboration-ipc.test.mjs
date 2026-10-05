@@ -58,6 +58,7 @@ function harness(read = async () => summary, sidecar = null) {
     registrar: { handle: (channel, handler) => handlers.set(channel, handler) },
     getHost: () => host,
     getSidecar: () => sidecar,
+    getAgentHostBridge: unexpected,
     sessionCapabilityContext: unexpected,
     enrichSession: unexpected,
     acquireSessionOperation: unexpected,

@@ -8,7 +8,11 @@ import type {
   UiMessage,
 } from "@pi-desktop/shared";
 
-import { AgentHost } from "./agent-host.js";
+import {
+  AgentHost,
+  projectApprovalForPersonalBrowser,
+  type PersonalBrowserAuthority,
+} from "./agent-host.js";
 import type { ApprovalPort, PendingToolRequest } from "./approvals.js";
 import {
   MemoryQueueStore,
@@ -46,6 +50,7 @@ class FakeRuntime implements RuntimePort {
   private counter = 0;
   promptOverride?: (request: TurnStartRequest) => Promise<{ turnId: string }>;
   failNext = false;
+  busySessions = new Set<string>();
   /** When true, `steer` refuses so the promoted block must fall back. */
   refuseSteers = false;
   async prompt(request: TurnStartRequest): Promise<{ turnId: string }> {
@@ -74,6 +79,9 @@ class FakeRuntime implements RuntimePort {
   }
   async respondInput(resolution: AskToolResolution): Promise<void> {
     this.inputs.push(resolution);
+  }
+  isBusy(sessionId: string): boolean {
+    return this.busySessions.has(sessionId);
   }
 }
 
@@ -109,6 +117,17 @@ const owner: Principal = { subject: "desktop", roles: ["owner"], pairedDevice: t
 const controller: Principal = { subject: "phone", roles: ["controller"] };
 const approver: Principal = { subject: "reviewer", roles: ["approver"] };
 const viewer: Principal = { subject: "watcher", roles: ["viewer"] };
+const personalBrowser: Principal = {
+  subject: "mobile-browser-personal",
+  roles: ["controller", "approver"],
+  pairedDevice: false,
+};
+const personalBrowserAuthority: PersonalBrowserAuthority = {
+  kind: "personal-browser",
+  principalSubject: personalBrowser.subject,
+  maxPermissionMode: "auto",
+  allowSessionGrants: true,
+};
 
 function summary(id: string, permissionMode: SessionSummary["permissionMode"] = "ask"): SessionSummary {
   return {
@@ -150,6 +169,22 @@ function build(options: { permissionMode?: SessionSummary["permissionMode"]; que
   const sub = host.subscribe(viewer, { scope: "session", sessionId: "s1" }, { deliver: (event) => received.push(event), close: () => {} });
   return { runtime, sessions, approvals, clock, host, received, sub };
 }
+
+describe("trusted transcript replacement admission", () => {
+  it("forwards a validated history boundary and user identity to the runtime", async () => {
+    const {host,runtime}=build();
+    await host.startTurn(personalBrowser,{sessionId:"s1",truncateFromMessageId:"old-user",input:{text:"Edited prompt",userMessageId:"new-user"},context:{requestId:"edit"}},personalBrowserAuthority);
+    expect(runtime.prompts[0]).toMatchObject({truncateFromMessageId:"old-user",userMessageId:"new-user",principal:personalBrowser,effectivePermissionMode:"ask"});
+  });
+  it("refuses queued or busy history edits before the runtime sees them", async () => {
+    const {host,runtime}=build();
+    await expect(host.enqueueTurn(personalBrowser,{sessionId:"s1",truncateFromMessageId:"old-user",input:{text:"Edit"},context:{requestId:"queued-edit"}},personalBrowserAuthority)).rejects.toMatchObject({code:"AGENT_BUSY"});
+    await host.startTurn(owner,{sessionId:"s1",input:{text:"Current"},context:{requestId:"current"}});
+    await expect(host.startTurn(personalBrowser,{sessionId:"s1",admission:"queue",truncateFromMessageId:"old-user",input:{text:"Edit"},context:{requestId:"busy-edit"}},personalBrowserAuthority)).rejects.toMatchObject({code:"AGENT_BUSY"});
+    expect(runtime.prompts).toHaveLength(1);
+    expect(host.queueEntries("s1")).toHaveLength(0);
+  });
+});
 
 describe("AgentHost ingest", () => {
   it("provides live work state without reading transcript history", async () => {
@@ -350,6 +385,115 @@ describe("AgentHost turns", () => {
     await vi.waitFor(() => expect(runtime.prompts.at(-1)?.sessionMessageId).toBe("m2"));
   });
 
+  it("lets deletion win admission before a turn and makes the delayed turn observe deletion", async () => {
+    const { host, runtime, sessions } = build();
+    let enterDeletion!: () => void;
+    let releaseDeletion!: () => void;
+    const deletionEntered = new Promise<void>((resolve) => { enterDeletion = resolve; });
+    const deletionGate = new Promise<void>((resolve) => { releaseDeletion = resolve; });
+    const deletion = host.withSessionDeletion(
+      "s1",
+      async () => () => {},
+      async () => {
+        enterDeletion();
+        await deletionGate;
+        sessions.summaries.delete("s1");
+      },
+    );
+    await deletionEntered;
+
+    const delayedTurn = host.startTurn(owner, {
+      sessionId: "s1",
+      input: { text: "must not start" },
+      context: { requestId: "delete-first" },
+    });
+    await Promise.resolve();
+    expect(runtime.prompts).toHaveLength(0);
+
+    releaseDeletion();
+    await deletion;
+    await expect(delayedTurn).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(runtime.prompts).toHaveLength(0);
+  });
+
+  it("lets an admitted turn win before deletion and rejects deletion as busy", async () => {
+    const { host, runtime } = build();
+    let enterPrompt!: () => void;
+    let releasePrompt!: () => void;
+    const promptEntered = new Promise<void>((resolve) => { enterPrompt = resolve; });
+    const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    runtime.promptOverride = async () => {
+      enterPrompt();
+      await promptGate;
+      return { turnId: "runtime-turn" };
+    };
+    const starting = host.startTurn(owner, {
+      sessionId: "s1",
+      input: { text: "starts first" },
+      context: { requestId: "turn-first" },
+    });
+    await promptEntered;
+
+    const acquireRuntimeExclusion = vi.fn(async () => () => {});
+    const deleteOperation = vi.fn(async () => {});
+    const deletion = host.withSessionDeletion("s1", acquireRuntimeExclusion, deleteOperation);
+    releasePrompt();
+    await starting;
+
+    await expect(deletion).rejects.toMatchObject({ code: "AGENT_BUSY" });
+    expect(acquireRuntimeExclusion).not.toHaveBeenCalled();
+    expect(deleteOperation).not.toHaveBeenCalled();
+  });
+
+  it("rechecks runtime finalization after external exclusion and releases both locks on failure", async () => {
+    const { host, runtime } = build();
+    let releaseCount = 0;
+    await expect(host.withSessionDeletion(
+      "s1",
+      async () => {
+        runtime.busySessions.add("s1");
+        return () => {
+          runtime.busySessions.delete("s1");
+          releaseCount += 1;
+        };
+      },
+      async () => {},
+    )).rejects.toMatchObject({ code: "AGENT_BUSY" });
+    expect(releaseCount).toBe(1);
+
+    await expect(host.withSessionDeletion(
+      "s1",
+      async () => () => { releaseCount += 1; },
+      async () => { throw new Error("delete failed"); },
+    )).rejects.toThrow("delete failed");
+    expect(releaseCount).toBe(2);
+    await expect(host.startTurn(owner, {
+      sessionId: "s1",
+      input: { text: "lock was released" },
+      context: { requestId: "after-delete-failure" },
+    })).resolves.toMatchObject({ turn: { status: "running" } });
+  });
+
+  it("rejects deletion while a restored queue is pending", async () => {
+    const queueStore = new MemoryQueueStore();
+    await queueStore.push({
+      id: "queued-turn",
+      sessionId: "s1",
+      principalSubject: owner.subject,
+      content: "pending",
+      effectivePermissionMode: "ask",
+      inputHash: "pending-hash",
+      createdAt: Date.parse("2026-09-10T00:00:00.000Z"),
+    });
+    const { host } = build({ queueStore });
+    await host.start();
+    const deleteOperation = vi.fn(async () => {});
+
+    await expect(host.withSessionDeletion("s1", async () => () => {}, deleteOperation))
+      .rejects.toMatchObject({ code: "AGENT_BUSY" });
+    expect(deleteOperation).not.toHaveBeenCalled();
+  });
+
   it("rejects Live admission after the bound workspace identity changes", async () => {
     const { host, sessions, runtime } = build();
     const authorized = JSON.stringify(["project-a", "/workspace/a"]);
@@ -447,6 +591,66 @@ describe("AgentHost turns", () => {
     ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
   });
 
+  it("applies an explicit personal-browser ceiling without granting paired-device status", async () => {
+    const { host, runtime } = build({ permissionMode: "auto" });
+    const started = await host.startTurn(personalBrowser, {
+      sessionId: "s1",
+      permissionModeCeiling: "accept-edits",
+      input: { text: "edit the project" },
+      context: { requestId: "personal-browser-r1" },
+    }, personalBrowserAuthority);
+    expect(started.turn.effectivePermissionMode).toBe("accept-edits");
+    expect(runtime.prompts[0]?.effectivePermissionMode).toBe("accept-edits");
+    expect(runtime.prompts[0]?.principal).toMatchObject({
+      subject: personalBrowser.subject,
+      pairedDevice: false,
+    });
+
+    host.ingest(envelope("s1", started.turn.id, { type: "agent_end", messageIds: [] }));
+    const wrongSubject = {
+      ...personalBrowserAuthority,
+      principalSubject: "mobile-browser-someone-else",
+    };
+    const narrowed = await host.startTurn(personalBrowser, {
+      sessionId: "s1",
+      input: { text: "must stay ask" },
+      context: { requestId: "personal-browser-r2" },
+    }, wrongSubject);
+    expect(narrowed.turn.effectivePermissionMode).toBe("ask");
+    expect(runtime.prompts[1]?.effectivePermissionMode).toBe("ask");
+  });
+
+  it("narrows a paired turn per request and fingerprints and queues the effective mode", async () => {
+    const queueStore = new MemoryQueueStore();
+    const { host, runtime } = build({ permissionMode: "auto", queueStore });
+    const request = {
+      sessionId: "s1",
+      idempotencyKey: "narrow-once",
+      permissionModeCeiling: "accept-edits" as const,
+      input: { text: "limited desktop action" },
+      context: { requestId: "narrow-r1" },
+    };
+    const started = await host.startTurn(owner, request);
+    expect(started.turn.effectivePermissionMode).toBe("accept-edits");
+    expect(runtime.prompts[0]?.effectivePermissionMode).toBe("accept-edits");
+    expect((await host.startTurn(owner, request)).turn.id).toBe(started.turn.id);
+    await expect(host.startTurn(owner, {
+      ...request,
+      permissionModeCeiling: "ask",
+      context: { requestId: "narrow-r2" },
+    })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+
+    const queued = await host.startTurn(owner, {
+      sessionId: "s1",
+      admission: "queue",
+      permissionModeCeiling: "ask",
+      input: { text: "queued strict action" },
+      context: { requestId: "narrow-r3" },
+    });
+    expect(queued.turn.effectivePermissionMode).toBe("ask");
+    expect((await queueStore.listAll())[0]?.effectivePermissionMode).toBe("ask");
+  });
+
   it("exempts the paired desktop from the ceiling and rejects stale revisions", async () => {
     const { host, runtime } = build({ permissionMode: "auto" });
     await expect(
@@ -541,6 +745,48 @@ describe("AgentHost turns", () => {
     // The injected row never runs its own turn.
     expect(host.getTurn(second.turn.id).status).toBe("canceled");
     expect(host.getTurn(third.turn.id).status).toBe("running");
+  });
+
+  it("keeps a stricter promoted row out of a wider running turn", async () => {
+    const { host, runtime } = build({ permissionMode: "auto" });
+    const first = await host.startTurn(owner, {
+      sessionId: "s1",
+      input: { text: "current" },
+      context: { requestId: "mixed-r1" },
+    });
+    host.ingest(envelope("s1", first.turn.id, { type: "agent_start" }));
+    const wide = await host.startTurn(owner, {
+      sessionId: "s1",
+      admission: "queue",
+      input: { text: "desktop auto" },
+      context: { requestId: "mixed-r2" },
+    });
+    const narrow = await host.startTurn(controller, {
+      sessionId: "s1",
+      admission: "queue",
+      input: { text: "phone ask" },
+      context: { requestId: "mixed-r3" },
+    });
+    expect(wide.turn.effectivePermissionMode).toBe("auto");
+    expect(narrow.turn.effectivePermissionMode).toBe("ask");
+    await host.prioritizeTurn(owner, wide.turn.id);
+    await host.prioritizeTurn(controller, narrow.turn.id);
+
+    host.ingest(envelope("s1", first.turn.id, { type: "agent_end", messageIds: [] }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(runtime.prompts.map((prompt) => [prompt.content, prompt.effectivePermissionMode])).toEqual([
+      ["current", "auto"],
+      ["desktop auto", "auto"],
+    ]);
+    expect(runtime.steers).toHaveLength(0);
+    expect(host.queueEntries("s1").map((entry) => entry.content)).toEqual(["phone ask"]);
+    expect(host.getTurn(narrow.turn.id).status).toBe("queued");
+
+    host.ingest(envelope("s1", "rt_2", { type: "agent_end", messageIds: [] }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.prompts.at(-1)).toMatchObject({ content: "phone ask", effectivePermissionMode: "ask" });
   });
 
   it("keeps a promoted row queued when the runtime cannot steer it", async () => {
@@ -700,6 +946,46 @@ describe("AgentHost approvals and inputs", () => {
     const again = await host.respondApproval(owner, { approvalId: "req_1", decision: "deny", context: { requestId: "r2" } });
     expect(again.alreadyResolved).toBe(true);
     expect(approvals.tool).toHaveLength(1);
+  });
+
+  it("grants allow-session only through the matching personal-browser authority", async () => {
+    const first = build();
+    first.host.ingest(envelope("s1", "rt_1", { type: "agent_start" }));
+    first.host.ingest(envelope("s1", "rt_1", permission()));
+    const canonical = first.host.pendingApprovals("s1")[0]!;
+    expect(canonical.allowedDecisions).toEqual(["allow-once", "deny"]);
+    expect(
+      projectApprovalForPersonalBrowser(
+        canonical,
+        personalBrowser,
+        personalBrowserAuthority,
+      ).allowedDecisions,
+    ).toEqual(["allow-once", "deny", "allow-session"]);
+    await first.host.respondApproval(personalBrowser, {
+      approvalId: "req_1",
+      decision: "allow-session",
+      context: { requestId: "personal-browser-approval" },
+    }, personalBrowserAuthority);
+    expect(first.approvals.tool).toEqual([
+      { requestId: "req_1", decision: "allow-session" },
+    ]);
+
+    const second = build();
+    second.host.ingest(envelope("s1", "rt_1", { type: "agent_start" }));
+    second.host.ingest(envelope("s1", "rt_1", permission()));
+    await expect(second.host.respondApproval(personalBrowser, {
+      approvalId: "req_1",
+      decision: "allow-session",
+      context: { requestId: "missing-authority" },
+    })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(second.host.respondApproval(personalBrowser, {
+      approvalId: "req_1",
+      decision: "allow-session",
+      context: { requestId: "wrong-authority" },
+    }, {
+      ...personalBrowserAuthority,
+      principalSubject: "mobile-browser-someone-else",
+    })).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
   it("lets the desktop card settle an approval so a later remote answer is a no-op", async () => {

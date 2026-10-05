@@ -33,6 +33,11 @@ export type ComposerIpcDependencies = {
 export type ComposerCommandService = {
   buildComposerCommands: (root: string | null) => Promise<ComposerCommand[]>;
 };
+let registeredCommandService: ComposerCommandService | undefined;
+export function getRegisteredComposerCommandService(): ComposerCommandService {
+  if(!registeredCommandService)throw new Error("composer command service is unavailable");
+  return registeredCommandService;
+}
 
 export function createComposerCommandService({
   plugins,
@@ -154,6 +159,7 @@ export function registerComposerIpc({
   ...serviceDependencies
 }: ComposerIpcDependencies): ComposerCommandService {
   const service = createComposerCommandService(serviceDependencies);
+  registeredCommandService = service;
   registrar.handle(IPC.invoke.composerCommands, async () => {
     const root = await optionalWorkspaceRoot();
     return { commands: await service.buildComposerCommands(root) };

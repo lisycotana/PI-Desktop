@@ -105,18 +105,9 @@ export function createAgentHostBridge(options: AgentHostBridgeOptions) {
     async prompt(request: TurnStartRequest) {
       try {
         const summary = await sessions.get(request.sessionId);
-        // A per-turn ceiling that would WIDEN the session's stored mode is a
-        // real escalation attempt — e.g. a remote viewer whose principal is
-        // subject to `remoteMaxPermissionMode: "ask"` should never be able to
-        // run a turn at `auto`. Refuse before the sidecar sees the request.
-        //
-        // A NARROWER ceiling (or the same mode) is safe to accept: it can only
-        // reduce what the turn is allowed to do. The runtime still uses the
-        // session's stored mode when it enforces tool decisions, so a narrower
-        // request is not yet honoured turn-locally — that is the R1 leftover
-        // waiting on host-core to accept a `permissionMode` override on
-        // `session.beginTurn`. We plumb the parameter end-to-end anyway so the
-        // enforcement gate can flip on without another wire change.
+        // A per-turn ceiling that would WIDEN the current session mode is a
+        // real escalation attempt. Refuse it before either Host or sidecar
+        // sees the request; host-core repeats this check at durable admission.
         if (
           summary &&
           summary.permissionMode !== request.effectivePermissionMode &&
@@ -133,19 +124,19 @@ export function createAgentHostBridge(options: AgentHostBridgeOptions) {
             },
           );
         }
-        const permissionModeOverride =
-          summary && summary.permissionMode !== request.effectivePermissionMode
-            ? request.effectivePermissionMode
-            : undefined;
         const result = (await options.invoke(options.channels.agentPrompt, [
           {
             sessionId: request.sessionId,
-            content: request.content,
+              content: request.content,
+              ...(request.truncateFromMessageId ? { truncateFromMessageId: request.truncateFromMessageId } : {}),
             ...(request.sessionMessageId ? { sessionMessageId: request.sessionMessageId } : {}),
             ...(request.userMessageId ? { messageId: request.userMessageId } : {}),
             ...(request.voiceOrigin ? { voiceOrigin: request.voiceOrigin } : {}),
             ...(request.attachments ? { attachments: request.attachments } : {}),
-            ...(permissionModeOverride ? { permissionMode: permissionModeOverride } : {}),
+            // Always bind the effective value to this turn, even when it
+            // currently equals the durable mode. A later policy change must
+            // never make an already-admitted remote turn more permissive.
+            permissionMode: request.effectivePermissionMode,
           },
         ])) as { accepted?: boolean; turnId: string };
         return { turnId: result.turnId };
@@ -336,6 +327,13 @@ export function createAgentHostBridge(options: AgentHostBridgeOptions) {
 
   return {
     agentHost,
+    async withSessionDeletion<T>(
+      sessionId: string,
+      acquireSessionOperation: () => Promise<() => void>,
+      operation: () => Promise<T>,
+    ): Promise<T> {
+      return forIpc(() => agentHost.withSessionDeletion(sessionId, acquireSessionOperation, operation));
+    },
     observeWorkTarget(sessionId: string): string | null {
       return agentHost.observeWorkTarget(sessionId).activeTurnId;
     },

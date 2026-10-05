@@ -210,7 +210,19 @@ function loadSessionIpc(imports) {
   return module.exports;
 }
 
-function forkHarness({ host, sidecar, activeTurns = new Map() }) {
+function forkHarness({
+  host,
+  sidecar,
+  activeTurns = new Map(),
+  getAgentHostBridge = () => ({
+    withSessionDeletion: async (_sessionId, acquireSessionOperation, operation) => {
+      const release = await acquireSessionOperation();
+      try { return await operation(); } finally { release(); }
+    },
+  }),
+  acquireSessionOperation = async () => () => {},
+  persistenceOutbox = {},
+}) {
   const handlers = new Map();
   const hostCalls = [];
   const sidecarCalls = [];
@@ -227,19 +239,21 @@ function forkHarness({ host, sidecar, activeTurns = new Map() }) {
     registrar: { handle: (channel, handler) => handlers.set(channel, handler) },
     getHost: () => host(hostCalls),
     getSidecar: () => sidecar(sidecarCalls),
+    getAgentHostBridge,
     dataDir: "/tmp/pi-desktop-test",
     activeTurns,
     sessionProjects: new Map(),
-    persistenceOutbox: {},
+    persistenceOutbox,
     logger: { app() {} },
     plugins: { broadcastEvent() {} },
     sessionCapabilityContext: async () => ({ providers: [], defaults: {} }),
     enrichSession: (session) => session,
-    acquireSessionOperation: async () => () => {},
+    acquireSessionOperation,
     stripWinLongPrefix: (value) => value,
   });
   return {
     handle: handlers.get(IPC.invoke.sessionFork),
+    deleteSession: handlers.get(IPC.invoke.sessionDelete),
     search: handlers.get(IPC.invoke.sessionSearch),
     hostCalls,
     sidecarCalls,
@@ -275,6 +289,49 @@ test("global session search merges native sidecar hits with Desktop results", as
   assert.deepEqual(result.hits.map((hit) => hit.session.id), ["native-pi:child", "desktop-session"]);
   assert.deepEqual(sidecarCalls, [{ method: "native.session.search", input: { query: "side chat" } }]);
   assert.deepEqual(hostCalls, [{ method: "search.sessions", input: { query: "side chat", offset: 0 } }]);
+});
+
+test("canonical session delete holds the shared admission and runtime reservation through cleanup", async () => {
+  const order = [];
+  const { deleteSession } = forkHarness({
+    host: () => ({
+      call: async (method, input) => {
+        order.push(["host", method, input]);
+        return { deleted: true };
+      },
+    }),
+    sidecar: () => ({
+      clearProjectInstructionRoot: (sessionId) => order.push(["clear-project", sessionId]),
+      clearVendorAuthBindings: (sessionId) => order.push(["clear-auth", sessionId]),
+      call: async (method, input) => order.push(["sidecar", method, input]),
+    }),
+    getAgentHostBridge: () => ({
+      withSessionDeletion: async (sessionId, acquireSessionOperation, operation) => {
+        order.push(["admission", sessionId]);
+        const release = await acquireSessionOperation();
+        try { return await operation(); } finally { release(); }
+      },
+    }),
+    acquireSessionOperation: async (sessionId) => {
+      order.push(["runtime-lock", sessionId]);
+      return () => order.push(["runtime-unlock", sessionId]);
+    },
+    persistenceOutbox: {
+      dropSession: async (sessionId) => order.push(["outbox", sessionId]),
+    },
+  });
+
+  assert.deepEqual(await deleteSession("desktop-session"), { deleted: true });
+  assert.deepEqual(order, [
+    ["admission", "desktop-session"],
+    ["runtime-lock", "desktop-session"],
+    ["host", "session.delete", { id: "desktop-session" }],
+    ["outbox", "desktop-session"],
+    ["clear-project", "desktop-session"],
+    ["clear-auth", "desktop-session"],
+    ["sidecar", "agent.disposeSession", { sessionId: "desktop-session" }],
+    ["runtime-unlock", "desktop-session"],
+  ]);
 });
 
 test("native fork routes to the sidecar and never to the Desktop host", async () => {

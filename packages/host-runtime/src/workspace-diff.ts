@@ -22,7 +22,9 @@ type RunResult = { code: number; stdout: string; stderr: string };
 
 function runGit(cwd: string, args: string[]): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, env: process.env });
+    const child = spawn("git", ["-c", "core.fsmonitor=false", ...args], {
+      cwd, windowsHide: true, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += String(d)));
@@ -238,6 +240,7 @@ export async function collectWorkspaceDiff(cwd: string): Promise<WorkspaceDiff> 
     base,
     "--no-color",
     "--no-ext-diff",
+    "--no-textconv",
     "-M",
     "--unified=3",
   ]);
@@ -255,6 +258,7 @@ export async function collectWorkspaceDiff(cwd: string): Promise<WorkspaceDiff> 
       "diff",
       "--no-color",
       "--no-ext-diff",
+      "--no-textconv",
       "--unified=3",
       "--no-index",
       "--",

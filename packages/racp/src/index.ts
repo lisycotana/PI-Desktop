@@ -4,4 +4,5 @@ export * from "./host-operations.js";
 export * from "./server.js";
 export * from "./client.js";
 export * from "./ws-binding.js";
+export { createOperations } from "./operations.js";
 export type { OperationContext, OperationHandler } from "./operations.js";

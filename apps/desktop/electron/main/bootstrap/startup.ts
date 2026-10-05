@@ -1,4 +1,5 @@
 import { app, BrowserWindow, crashReporter, Menu, safeStorage } from "electron";
+import { join } from "node:path";
 import { createScheduledRunner } from "../runtime/scheduled-runner";
 import {
   APP_NAME,
@@ -19,6 +20,8 @@ import { readCloseBehavior } from "../window-preferences";
 import { createAgentHostBridge, type AgentHostBridge } from "../agent-host-bridge";
 import { createBackendRouter, type BackendRouter } from "../remote/backend-router";
 import { createRemoteHostsBoot, setActiveRemoteHostsBoot } from "./remote-hosts";
+import { createMobileCompanionBoot, setActiveMobileCompanion } from "./mobile-companion";
+import { loadBrowserAssets } from "../mobile/browser-assets";
 import {
   createMcpControlController,
   McpControlServer,
@@ -300,6 +303,19 @@ export function registerApplicationStartup(deps: StartupDependencies): void {
     scheduledRunner.start();
     app.once("before-quit", () => scheduledRunner.stop());
     if (!bootError && state.agentHostBridge) {
+        const mobile = createMobileCompanionBoot({
+          agentHost: state.agentHostBridge.agentHost,
+          getHost,
+          invoke: invokeIpc,
+          isSessionBusy,
+          getMainWindow,
+          getLocale:() => app.getLocale(),
+          loadBrowserAssets: () => loadBrowserAssets(join(app.getAppPath(), "out", "mobile")),
+        dataDir,
+        log: (message) => logger.app("runtime", "info", message),
+      });
+      setActiveMobileCompanion(mobile);
+      void mobile.open().catch(() => logger.app("runtime", "warn", "mobile companion startup failed"));
       // Restore the persisted turn queue now that host-core answers. Restored
       // entries stay held until a controller attaches (D375).
       state.agentHostBridge.agentHost.start().catch((error) => {

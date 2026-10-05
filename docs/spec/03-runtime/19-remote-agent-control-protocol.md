@@ -750,6 +750,15 @@ holds `owner` and is exempt from the ceiling by default; the Host policy
 `applyCeilingToPairedDevices` re-applies it
 (`05-security/02-remote-control-security.md` §4.3).
 
+The runtime binds `effectivePermissionMode` to the durable Host turn when the
+turn begins. Every tool decision uses the stricter of that bound value and the
+Session's current durable/default mode, so a later policy change can tighten
+an active turn but cannot widen it. The Host rejects a per-turn value that is
+wider at admission and clears the process-local binding only when that exact
+turn completes, errors, aborts, or is truncated. A queued input with a stricter
+mode MUST NOT be steered into a wider active turn; it stays queued and starts
+its own turn at the next boundary.
+
 ### 7.4 `turn/stop`, `turn/interrupt`, and `turn/cancel`
 
 Request:
@@ -1285,3 +1294,14 @@ D375 (2026-09-10) re-sequenced the deployments and extended the catalog:
 - queued turns persisted by host-core and held after a restart, the
   30-minute default approval lifetime for remote subscribers, and the
   `applyCeilingToPairedDevices` policy.
+
+
+## Personal browser companion in this fork
+
+The opt-in companion advertises a controller subset, not full RACP-HTTP
+conformance. It uses canonical operation schemas/handlers with an explicit
+allowlist and cookie/Origin/CSRF authentication. Canonical owner rules above
+remain unchanged. Personal browser pairing additionally grants only idle
+conversation deletion through the desktop cleanup IPC, without owner or
+paired-device privileges. See the [browser companion ADR](../../adr/mobile-companion-readonly-browser.md)
+and [task workflow acceptance](../06-delivery/mobile-companion-task-workflow.md).

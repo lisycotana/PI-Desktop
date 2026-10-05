@@ -301,6 +301,36 @@ describe("remote permission ceiling", () => {
       }),
     ).toBe("auto");
   });
+
+  it("applies a requested per-turn ceiling after session and Host policy", () => {
+    expect(
+      effectiveRemotePermissionMode({
+        sessionMode: "auto",
+        requestedCeiling: "ask",
+        policy,
+        pairedDevice: true,
+        approverOverride: false,
+      }),
+    ).toBe("ask");
+    expect(
+      effectiveRemotePermissionMode({
+        sessionMode: "auto",
+        requestedCeiling: "auto",
+        policy,
+        pairedDevice: false,
+        approverOverride: false,
+      }),
+    ).toBe("ask");
+    expect(
+      effectiveRemotePermissionMode({
+        sessionMode: "ask",
+        requestedCeiling: "auto",
+        policy: { ...policy, remoteMaxPermissionMode: "auto" },
+        pairedDevice: true,
+        approverOverride: false,
+      }),
+    ).toBe("ask");
+  });
 });
 
 describe("catalog and roles", () => {

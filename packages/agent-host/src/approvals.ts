@@ -149,6 +149,7 @@ export class ApprovalBroker {
     response: RacpApprovalResponse,
     principal: Principal,
     currentRevision: number,
+    authority: { allowSessionGrant?: boolean } = {},
   ): Promise<RacpApprovalResult> {
     const remembered = this.results.get(response.approvalId);
     if (remembered) return { ...remembered, alreadyResolved: true };
@@ -165,7 +166,11 @@ export class ApprovalBroker {
       });
     }
     const decisions: readonly string[] = entry.request.allowedDecisions;
-    if (!decisions.includes(response.decision)) {
+    const trustedPersonalBrowserGrant =
+      entry.request.kind === "tool" &&
+      response.decision === "allow-session" &&
+      authority.allowSessionGrant === true;
+    if (!decisions.includes(response.decision) && !trustedPersonalBrowserGrant) {
       throw racpError("INVALID_ARGUMENT", `decision ${response.decision} is not offered by this approval`);
     }
     if (entry.request.kind === "tool") {

@@ -754,6 +754,8 @@ const PERMISSION_MODE_RANK: Record<RacpPermissionMode, number> = {
 
 export type RacpCeilingInput = {
   sessionMode: RacpPermissionMode;
+  /** Optional per-turn cap chosen by the caller; it can only narrow access. */
+  requestedCeiling?: RacpPermissionMode;
   policy: Pick<RacpPolicy, "remoteMaxPermissionMode" | "applyCeilingToPairedDevices">;
   /** True for the SSH-paired desktop device that owns the Host. */
   pairedDevice: boolean;
@@ -769,11 +771,14 @@ export type RacpCeilingInput = {
 export function effectiveRemotePermissionMode(input: RacpCeilingInput): RacpPermissionMode {
   const exempt =
     (input.pairedDevice && !input.policy.applyCeilingToPairedDevices) || input.approverOverride;
-  if (exempt) return input.sessionMode;
-  const ceiling = input.policy.remoteMaxPermissionMode;
-  return PERMISSION_MODE_RANK[input.sessionMode] <= PERMISSION_MODE_RANK[ceiling]
+  const policyCeiling = exempt ? input.sessionMode : input.policy.remoteMaxPermissionMode;
+  const policyEffective = PERMISSION_MODE_RANK[input.sessionMode] <= PERMISSION_MODE_RANK[policyCeiling]
     ? input.sessionMode
-    : ceiling;
+    : policyCeiling;
+  const requestedCeiling = input.requestedCeiling;
+  return requestedCeiling && PERMISSION_MODE_RANK[requestedCeiling] < PERMISSION_MODE_RANK[policyEffective]
+    ? requestedCeiling
+    : policyEffective;
 }
 
 // ---------------------------------------------------------------------------
