@@ -44,6 +44,7 @@ class FakeRuntime implements RuntimePort {
   aborts: Array<{ sessionId: string; turnId?: string }> = [];
   inputs: AskToolResolution[] = [];
   private counter = 0;
+  promptOverride?: (request: TurnStartRequest) => Promise<{ turnId: string }>;
   failNext = false;
   /** When true, `steer` refuses so the promoted block must fall back. */
   refuseSteers = false;
@@ -54,6 +55,7 @@ class FakeRuntime implements RuntimePort {
       throw Object.assign(new Error("runtime rejected"), { code: "AGENT_UNAVAILABLE" });
     }
     this.prompts.push(request);
+    if (this.promptOverride) return this.promptOverride(request);
     this.counter += 1;
     return { turnId: `rt_${this.counter}` };
   }
@@ -78,10 +80,12 @@ class FakeRuntime implements RuntimePort {
 class FakeSessions implements SessionPort {
   summaries = new Map<string, SessionSummary>();
   items: RacpItemSummary[] = [];
+  historyReads = 0;
   async get(sessionId: string): Promise<SessionSummary | null> {
     return this.summaries.get(sessionId) ?? null;
   }
   async history(): Promise<{ items: RacpItemSummary[]; hasMore: boolean }> {
+    this.historyReads += 1;
     return { items: this.items, hasMore: false };
   }
 }
@@ -148,6 +152,17 @@ function build(options: { permissionMode?: SessionSummary["permissionMode"]; que
 }
 
 describe("AgentHost ingest", () => {
+  it("provides live work state without reading transcript history", async () => {
+    const { host, sessions } = build();
+    expect(await host.workSnapshot("s1")).toMatchObject({ sessionId: "s1", mode: "agent", state: "idle", queue: [] });
+    expect(sessions.historyReads).toBe(0);
+
+    await host.startTurn(owner, { sessionId: "s1", input: { text: "current" }, context: { requestId: "work-1" } });
+    await host.startTurn(owner, { sessionId: "s1", admission: "queue", input: { text: "later" }, context: { requestId: "work-2" } });
+    expect(await host.workSnapshot("s1")).toMatchObject({ state: "running", activeTurnId: "rt_1", queue: [{ position: 1 }] });
+    expect(sessions.historyReads).toBe(0);
+  });
+
   it("reconciles only a matching optimistic user item and ignores duplicate, unknown and wrong-turn acknowledgements", async () => {
     const { host, received, sessions } = build();
     sessions.summaries.set("s2", summary("s2"));
@@ -246,6 +261,59 @@ describe("AgentHost ingest", () => {
 });
 
 describe("AgentHost turns", () => {
+  it("drains an idle explicit enqueue and preserves voice provenance", async () => {
+    const { host, runtime } = build({ queueStore: new MemoryQueueStore() });
+    const result = await host.enqueueTurn(owner, {
+      sessionId: "s1",
+      idempotencyKey: "voice:call-1:operation-1",
+      input: {
+        text: "Check the login flow",
+        userMessageId: "message-1",
+        voiceOrigin: { callId: "call-1", operationId: "operation-1" },
+      },
+      context: { requestId: "voice-enqueue-1" },
+    });
+
+    expect(result.turn.status).toBe("running");
+    expect(runtime.prompts).toHaveLength(1);
+    expect(runtime.prompts[0]).toMatchObject({
+      content: "Check the login flow",
+      userMessageId: "message-1",
+      voiceOrigin: { callId: "call-1", operationId: "operation-1" },
+    });
+    expect(host.queueEntries("s1")).toHaveLength(0);
+  });
+
+  it("cannot cancel a voice queue entry after dispatch begins while its acknowledgement is pending", async () => {
+    const { host, runtime } = build({ queueStore: new MemoryQueueStore() });
+    const first = await host.startTurn(owner, {
+      sessionId: "s1", input: { text: "first" }, context: { requestId: "first-request" },
+    });
+    const queued = await host.enqueueTurn(owner, {
+      sessionId: "s1",
+      idempotencyKey: "voice:call-1:operation-queued",
+      input: { text: "voice follow-up", userMessageId: "voice-message", voiceOrigin: { callId: "call-1", operationId: "operation-queued" } },
+      context: { requestId: "queued-request" },
+    });
+    let acknowledge!: (value: { turnId: string }) => void;
+    let entered!: () => void;
+    const dispatching = new Promise<void>((resolve) => { entered = resolve; });
+    runtime.promptOverride = async () => {
+      entered();
+      return new Promise((resolve) => { acknowledge = resolve; });
+    };
+    host.ingest(envelope("s1", first.turn.id, { type: "agent_end", messageIds: [] }));
+    await dispatching;
+    const rejected = expect(host.cancelTurn(owner, queued.turn.id)).rejects.toMatchObject({ code: "CONFLICT" });
+    acknowledge({ turnId: "runtime-voice-queued" });
+    await rejected;
+    expect(host.getTurn(queued.turn.id).status).toBe("running");
+    expect(runtime.prompts.filter((request) => request.userMessageId === "voice-message")).toHaveLength(1);
+    expect(runtime.stops).toEqual([]);
+    expect(runtime.aborts).toEqual([]);
+    expect(host.queueEntries("s1")).toEqual([]);
+  });
+
   it("serializes same-session admission while independent sessions can start", async () => {
     const { host, runtime, sessions } = build();
     sessions.summaries.set("s2", summary("s2"));
@@ -282,6 +350,22 @@ describe("AgentHost turns", () => {
     await vi.waitFor(() => expect(runtime.prompts.at(-1)?.sessionMessageId).toBe("m2"));
   });
 
+  it("rejects Live admission after the bound workspace identity changes", async () => {
+    const { host, sessions, runtime } = build();
+    const authorized = JSON.stringify(["project-a", "/workspace/a"]);
+    sessions.summaries.set("s1", { ...summary("s1"), workspaceIdentity: JSON.stringify(["project-b", "/workspace/b"]) });
+
+    await expect(host.startTurn(owner, {
+      sessionId: "s1",
+      expectedWorkspaceIdentity: authorized,
+      input: { text: "do not run in the moved workspace", voiceOrigin: { callId: "call-1", operationId: "operation-1" } },
+      context: { requestId: "workspace-guard" },
+    })).rejects.toMatchObject({ code: "WORKSPACE_CHANGED" });
+
+    expect(runtime.prompts).toHaveLength(0);
+    expect(host.queueEntries("s1")).toHaveLength(0);
+  });
+
   it("includes collaboration identity in idempotency checks", async () => {
     const { host, runtime } = build();
     const request = {
@@ -291,6 +375,36 @@ describe("AgentHost turns", () => {
     expect(same.turn.id).toBe(first.turn.id);
     expect(runtime.prompts).toHaveLength(1);
     await expect(host.startTurn(owner, { ...request, input: { ...request.input, sessionMessageId: "m2" } })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
+  it("reconciles only the exact session, operation, and user-message identity", async () => {
+    const { host } = build();
+    const voiceOrigin = { callId: "call-a", operationId: "operation-a" };
+    const result = await host.startTurn(owner, {
+      sessionId: "s1",
+      idempotencyKey: "voice:call-a:operation-a",
+      input: { text: "inspect", userMessageId: "message-a", voiceOrigin },
+      context: { requestId: "request-a" },
+    });
+
+    expect(host.lookupTurnByIdempotency(owner, {
+      sessionId: "s1",
+      idempotencyKey: "voice:call-a:operation-a",
+      userMessageId: "message-a",
+      voiceOrigin,
+    })?.id).toBe(result.turn.id);
+    expect(host.lookupTurnByIdempotency(owner, {
+      sessionId: "s1",
+      idempotencyKey: "voice:call-a:operation-a",
+      userMessageId: "message-other",
+      voiceOrigin,
+    })).toBeUndefined();
+    expect(host.lookupTurnByIdempotency(owner, {
+      sessionId: "s1",
+      idempotencyKey: "voice:call-a:operation-a",
+      userMessageId: "message-a",
+      voiceOrigin: { ...voiceOrigin, operationId: "operation-other" },
+    })).toBeUndefined();
   });
 
   it("cancels a queued collaboration message without dispatching it", async () => {
@@ -383,9 +497,58 @@ describe("AgentHost turns", () => {
     expect(runtime.stops).toEqual(["s1"]);
   });
 
+  it("does not let a late prompt acknowledgement revive a terminal turn", async () => {
+    const { host, runtime } = build();
+    runtime.promptOverride = async () => {
+      host.ingest(envelope("s1", "runtime-early", { type: "agent_start" }));
+      host.ingest(envelope("s1", "runtime-early", { type: "agent_end", messageIds: [] }));
+      return { turnId: "runtime-early" };
+    };
+
+    const result = await host.startTurn(owner, {
+      sessionId: "s1",
+      input: { text: "finish quickly" },
+      context: { requestId: "prompt-ack-after-terminal" },
+    });
+
+    expect(result.turn.status).toBe("completed");
+    expect(host.getTurn(result.turn.id).status).toBe("completed");
+  });
+
+
+  it("delivers Send now into the active turn without stopping it or draining ordinary input", async () => {
+    const { host, runtime } = build();
+    const first = await host.startTurn(owner, { sessionId: "s1", input: { text: "original task" }, context: { requestId: "initial" } });
+    const second = await host.startTurn(owner, { sessionId: "s1", admission: "queue", input: { text: "ordinary follow-up" }, context: { requestId: "queued" } });
+    const attachments = [{ kind: "file" as const, path: "/fixture/notes.txt", name: "notes.txt" }];
+    const correction = await host.startTurn(owner, {
+      sessionId: "s1", admission: "queue",
+      input: { text: "correct the plan", userMessageId: "correction-user", attachments },
+      context: { requestId: "correction" },
+    });
+    expect(runtime.steers).toEqual([]);
+
+    await host.prioritizeTurn(owner, correction.turn.id);
+
+    expect(runtime.steers).toEqual([expect.objectContaining({
+      sessionId: "s1", turnId: "rt_1", content: "correct the plan",
+      userMessageId: "correction-user", attachments,
+    })]);
+    expect(runtime.stops).toEqual([]);
+    expect(runtime.aborts).toEqual([]);
+    expect(runtime.prompts.map((entry) => entry.content)).toEqual(["original task"]);
+    expect(host.getTurn(first.turn.id).status).toBe("running");
+    expect(host.getTurn(correction.turn.id).status).toBe("canceled");
+    expect(host.queueEntries("s1").map((entry) => entry.turn.id)).toEqual([second.turn.id]);
+
+    host.endTurn("s1", "rt_1", "completed");
+    await vi.waitFor(() => expect(runtime.prompts.map((entry) => entry.content)).toEqual(["original task", "ordinary follow-up"]));
+    expect(runtime.steers).toHaveLength(1);
+  });
 
   it("folds the rest of the promoted block into the started turn, in click order", async () => {
     const { host, runtime } = build();
+    runtime.refuseSteers = true;
     const first = await host.startTurn(controller, { sessionId: "s1", input: { text: "one" }, context: { requestId: "r1" } });
     host.ingest(envelope("s1", first.turn.id, { type: "agent_start" }));
     const second = await host.startTurn(controller, { sessionId: "s1", admission: "queue", input: { text: "two" }, context: { requestId: "r2" } });
@@ -396,6 +559,7 @@ describe("AgentHost turns", () => {
     await host.prioritizeTurn(controller, second.turn.id);
     expect(host.queueEntries("s1").map((entry) => entry.content)).toEqual(["three", "two"]);
 
+    runtime.refuseSteers = false;
     host.ingest(envelope("s1", first.turn.id, { type: "agent_end", messageIds: [] }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -409,6 +573,104 @@ describe("AgentHost turns", () => {
     // The injected row never runs its own turn.
     expect(host.getTurn(second.turn.id).status).toBe("canceled");
     expect(host.getTurn(third.turn.id).status).toBe("running");
+  });
+
+  it("retains queued input whose permission mode differs from the active turn", async () => {
+    const { host, runtime } = build({ permissionMode: "auto" });
+    const first = await host.startTurn(owner, { sessionId: "s1", input: { text: "owner task" }, context: { requestId: "owner" } });
+    const queued = await host.startTurn(controller, {
+      sessionId: "s1", admission: "queue", input: { text: "remote input" }, context: { requestId: "remote" },
+    });
+    expect(first.turn.effectivePermissionMode).toBe("auto");
+    expect(queued.turn.effectivePermissionMode).toBe("ask");
+
+    await host.prioritizeTurn(controller, queued.turn.id);
+
+    expect(runtime.steers).toEqual([]);
+    expect(runtime.stops).toEqual([]);
+    expect(host.queueEntries("s1").map((entry) => entry.turn.id)).toEqual([queued.turn.id]);
+    host.endTurn("s1", "rt_1", "completed");
+    await vi.waitFor(() => expect(runtime.prompts).toHaveLength(2));
+    expect(runtime.prompts[1]?.effectivePermissionMode).toBe("ask");
+  });
+
+  it("delivers into an externally started Desktop turn using the stored session mode", async () => {
+    const { host, runtime } = build({ permissionMode: "auto" });
+    host.ingest(envelope("s1", "desktop-turn", { type: "agent_start" }));
+    const correction = await host.startTurn(owner, { sessionId: "s1", admission: "queue", input: { text: "correct now" }, context: { requestId: "correction" } });
+    await host.prioritizeTurn(owner, correction.turn.id);
+    expect(runtime.steers).toEqual([expect.objectContaining({ turnId: "desktop-turn", content: "correct now" })]);
+    expect(host.queueEntries("s1")).toEqual([]);
+    expect(runtime.stops).toEqual([]);
+  });
+
+  it.each([controller, owner])("keeps remote input queued when promoting into an externally started Desktop turn ($subject)", async (promoter) => {
+    const { host, runtime } = build();
+    host.ingest(envelope("s1", "desktop-turn", { type: "agent_start" }));
+    const queued = await host.startTurn(controller, { sessionId: "s1", admission: "queue", input: { text: "remote input" }, context: { requestId: "remote" } });
+    await host.prioritizeTurn(promoter, queued.turn.id);
+    expect(runtime.steers).toEqual([]);
+    expect(host.queueEntries("s1").map((entry) => entry.turn.id)).toEqual([queued.turn.id]);
+    expect(runtime.stops).toEqual([]);
+  });
+
+  it("preserves boundary delivery for an unpaired controller's Send now", async () => {
+    const { host, runtime } = build();
+    const first = await host.startTurn(controller, { sessionId: "s1", input: { text: "remote task" }, context: { requestId: "first" } });
+    const queued = await host.startTurn(controller, { sessionId: "s1", admission: "queue", input: { text: "remote follow-up" }, context: { requestId: "second" } });
+    await host.prioritizeTurn(controller, queued.turn.id);
+    expect(runtime.steers).toEqual([]);
+    expect(host.queueEntries("s1")).toHaveLength(1);
+    host.endTurn("s1", first.turn.id, "completed");
+    await vi.waitFor(() => expect(runtime.prompts.map((entry) => entry.content)).toEqual(["remote task", "remote follow-up"]));
+  });
+
+  it("serializes concurrent Send now deliveries without stopping or duplicating input", async () => {
+    const { host, runtime } = build();
+    await host.startTurn(owner, { sessionId: "s1", input: { text: "original" }, context: { requestId: "original" } });
+    const first = await host.startTurn(owner, { sessionId: "s1", admission: "queue", input: { text: "first correction" }, context: { requestId: "first" } });
+    const second = await host.startTurn(owner, { sessionId: "s1", admission: "queue", input: { text: "second correction" }, context: { requestId: "second" } });
+    let acknowledge!: () => void;
+    const pending = new Promise<void>((resolve) => { acknowledge = resolve; });
+    runtime.steer = async (request) => {
+      runtime.steers.push(request);
+      if (request.content === "first correction") await pending;
+      return { accepted: true };
+    };
+    const firstSend = host.prioritizeTurn(owner, first.turn.id);
+    await vi.waitFor(() => expect(runtime.steers).toHaveLength(1));
+    await host.prioritizeTurn(owner, second.turn.id);
+    await expect(host.prioritizeTurn(owner, first.turn.id)).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(host.cancelTurn(owner, first.turn.id)).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(runtime.steers.map((entry) => entry.content)).toEqual(["first correction"]);
+    acknowledge();
+    await firstSend;
+    expect(runtime.steers.map((entry) => entry.content)).toEqual(["first correction", "second correction"]);
+    expect(host.queueEntries("s1")).toEqual([]);
+    expect(runtime.stops).toEqual([]);
+  });
+
+  it("preserves queued input when its target turn ends during steering admission", async () => {
+    const { host, runtime } = build();
+    await host.startTurn(owner, { sessionId: "s1", input: { text: "original" }, context: { requestId: "original" } });
+    const queued = await host.startTurn(owner, { sessionId: "s1", admission: "queue", input: { text: "correction" }, context: { requestId: "correction" } });
+    let refuse!: () => void;
+    const pending = new Promise<void>((resolve) => { refuse = resolve; });
+    const attempted: string[] = [];
+    runtime.steer = async (request) => {
+      attempted.push(request.turnId);
+      await pending;
+      return { accepted: false };
+    };
+    const send = host.prioritizeTurn(owner, queued.turn.id);
+    await vi.waitFor(() => expect(attempted).toEqual(["rt_1"]));
+    host.endTurn("s1", "rt_1", "completed");
+    expect(host.queueEntries("s1")).toHaveLength(1);
+    refuse();
+    await send;
+    await vi.waitFor(() => expect(runtime.prompts.map((entry) => entry.content)).toEqual(["original", "correction"]));
+    expect(attempted).toEqual(["rt_1"]);
+    expect(host.queueEntries("s1")).toEqual([]);
   });
 
   it("keeps a promoted row queued when the runtime cannot steer it", async () => {
@@ -482,12 +744,67 @@ describe("AgentHost turns", () => {
     expect(runtime.prompts.map((prompt) => prompt.content)).toEqual(["after reboot"]);
     expect(runtime.prompts[0]?.sessionMessageId).toBe("restored-message");
   });
+
+  it("reconciles a restored Live queue entry without releasing its held state", async () => {
+    const store = new MemoryQueueStore();
+    const voiceOrigin = { callId: "call-restored", operationId: "operation-restored" };
+    await store.push({
+      id: "turn_restored_live",
+      sessionId: "s1",
+      principalSubject: "desktop",
+      content: "held voice task",
+      userMessageId: "message-restored",
+      voiceOrigin,
+      effectivePermissionMode: "ask",
+      idempotencyKey: "voice:call-restored:operation-restored",
+      inputHash: "hash-restored",
+      createdAt: 1,
+    });
+    const { host, runtime } = build({ queueStore: store });
+    await host.start();
+
+    expect(host.lookupTurnByIdempotency(owner, {
+      sessionId: "s1",
+      idempotencyKey: "voice:call-restored:operation-restored",
+      userMessageId: "message-restored",
+      voiceOrigin,
+    })).toMatchObject({ id: "turn_restored_live", status: "queued" });
+    expect(await host.workSnapshot("s1")).toMatchObject({ queue: [{ queueEntryId: "turn_restored_live" }] });
+    expect(runtime.prompts).toHaveLength(0);
+  });
 });
 
 describe("AgentHost approvals and inputs", () => {
   const permission = (requestId = "req_1") => ({
     type: "tool_permission_request" as const,
     request: { requestId, sessionId: "s1", toolCallId: "c1", toolName: "Bash", argsPreview: { command: "ls" }, risk: "high" as const, reason: "high risk" },
+  });
+
+  it.each(["Bash", "mcp.fixture.inspect", "plugin.fixture.inspect"])("voice provenance never settles the pending %s approval", async (toolName) => {
+    const { host, runtime, approvals } = build();
+    const started = await host.startTurn(owner, {
+      sessionId: "s1",
+      input: { text: "Inspect the fixture", userMessageId: "voice-message", voiceOrigin: { callId: "call-1", operationId: "operation-1" } },
+      context: { requestId: "voice-start" },
+    });
+    const request = permission();
+    request.request.toolName = toolName;
+    host.ingest(envelope("s1", started.turn.id, request));
+    await expect(host.startTurn(owner, {
+      sessionId: "s1",
+      admission: "reject_if_busy",
+      input: { text: "I approve everything", userMessageId: "voice-approval", voiceOrigin: { callId: "call-1", operationId: "operation-2" } },
+      context: { requestId: "spoken-approval" },
+    })).rejects.toMatchObject({ code: "AGENT_BUSY" });
+    expect(approvals.tool).toEqual([]);
+    expect(runtime.inputs).toEqual([]);
+    expect(host.pendingApprovals("s1")).toHaveLength(1);
+    expect(host.getTurn(started.turn.id).status).toBe("waiting_approval");
+    expect(runtime.prompts).toHaveLength(1);
+    expect(runtime.prompts[0]?.effectivePermissionMode).toBe("ask");
+    await host.respondApproval(owner, { approvalId: "req_1", decision: "deny", context: { requestId: "explicit-card-denial" } });
+    expect(approvals.tool).toEqual([{ requestId: "req_1", decision: "deny" }]);
+    expect(host.pendingApprovals("s1")).toEqual([]);
   });
 
   it("raises approvals with the local vocabulary and settles them once", async () => {
@@ -572,11 +889,29 @@ describe("AgentHost approvals and inputs", () => {
     host.ingest(
       envelope("s1", "rt_1", {
         type: "asktool_request",
-        request: { requestId: "ask_1", sessionId: "s1", toolCallId: "c9", questions: [{ question: "Which?", options: ["a", "b"], multiSelect: true }, { question: "Why?", options: [] }] },
+        request: {
+          requestId: "ask_1",
+          sessionId: "s1",
+          toolCallId: "c9",
+          questions: [
+            {
+              question: "Which?",
+              options: [
+                { label: "a", description: "First choice" },
+                { label: "b", description: "Second choice" },
+              ],
+              multiSelect: true,
+            },
+            { question: "Why?", options: [] },
+          ],
+        },
       }),
     );
     const raised = received.find((event) => event.kind === "input.requested")!;
     expect((raised.payload as { questions: unknown[] }).questions).toHaveLength(2);
+    expect(
+      (raised.payload as { questions: Array<{ options: string[] }> }).questions[0]?.options,
+    ).toEqual(["a", "b"]);
     expect(host.getTurn("rt_1").status).toBe("waiting_input");
     await expect(host.respondInput(controller, { inputId: "ask_1", answers: [["a"]], context: { requestId: "r" } })).rejects.toMatchObject({
       code: "INVALID_ARGUMENT",

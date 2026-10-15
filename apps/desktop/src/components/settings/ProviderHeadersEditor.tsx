@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { APP_VERSION } from "@pi-desktop/shared";
+import { APP_VERSION, inspectHeaderValue } from "@pi-desktop/shared";
 import {
   KeyValueRows,
   pairsToRecord,
@@ -8,6 +8,7 @@ import {
 } from "../extensions/KeyValueRows";
 import { IconCheck, IconCopy } from "../icons";
 import { Button } from "../ui";
+import { useAppStore } from "../../stores/app-store";
 import { SettingsMenuSelect } from "./SettingsMenuSelect";
 
 type HeaderPreset = {
@@ -62,11 +63,39 @@ export function ProviderHeadersEditor({
 }) {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [importError, setImportError] = useState(false);
+  const showToast = useAppStore((state) => state.showToast);
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => () => window.clearTimeout(copyTimer.current), []);
+
+  // A refused value is still said next to the row it is about, while a value
+  // the host will fold on save is announced once as a toast — a fullwidth
+  // character is an IME slip, not a mystery, and the note that used to sit
+  // above the list took a line of layout for it. Only rows that will actually
+  // be persisted count: an unnamed, empty or already refused row has nothing
+  // to fold, and saying otherwise would read as if the whole row were fine.
+  const headerRows = pairs.map((pair) => {
+    const header = inspectHeaderValue(pair.value);
+    const storable =
+      pair.key.trim() !== "" && header.value !== "" && header.fault === null;
+    return { header, storable };
+  });
+  const foldedHeaderValue = headerRows.some(
+    (row) => row.storable && row.header.folded,
+  );
+  const faultyHeaderValue = headerRows.some((row) => row.header.fault !== null);
+
+  // The toast fires when a foldable value appears, never on mount and never
+  // twice while the same rows stay folded.
+  const foldedReportedRef = useRef(foldedHeaderValue);
+  useEffect(() => {
+    const wasFolded = foldedReportedRef.current;
+    foldedReportedRef.current = foldedHeaderValue;
+    if (foldedHeaderValue && !wasFolded) {
+      showToast(t("settings.headersFullwidthFolded"), { variant: "info" });
+    }
+  }, [foldedHeaderValue, showToast, t]);
 
   const addPreset = (key: string) => {
     const preset = HEADER_PRESETS.find((item) => item.key === key);
@@ -95,9 +124,8 @@ export function ProviderHeadersEditor({
     try {
       const imported = parseImportedHeaders(JSON.parse(await file.text()));
       onChange(mergeHeaderPairs(pairs, imported));
-      setImportError(false);
     } catch {
-      setImportError(true);
+      showToast(t("settings.headersImportError"), { variant: "error" });
     }
   };
 
@@ -152,9 +180,9 @@ export function ProviderHeadersEditor({
           />
         </div>
       </div>
-      {importError ? (
+      {faultyHeaderValue ? (
         <div className="provider-setup-header-error" role="alert">
-          {t("settings.headersImportError")}
+          {t("settings.headersValueNotLatin1")}
         </div>
       ) : null}
       <div className="provider-setup-header-list">

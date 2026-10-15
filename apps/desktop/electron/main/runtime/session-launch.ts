@@ -3,10 +3,10 @@ import {
   ErrorCodes as SharedErrorCodes,
   isActiveInProject,
   isCommandShellCatalog,
+  JEV_API_KEY_SECRET_REF,
   imageGenerationBindings,
   isImageGenerationModel,
   normalizeMode,
-  resolveBindingContextWindow,
   trustedExtensionAgentKeyFromProviderId,
   type CommandShellCatalog,
   type McpServerRecord,
@@ -20,7 +20,6 @@ import {
 import {
   capabilitiesFromModelConfig,
   clampThinkingLevel,
-  genericModelConfig,
   loadCustomSystemPrompt,
   loadInstructionChain,
   loadSubagentDefinitions,
@@ -33,15 +32,17 @@ import {
 import { builtinSkills } from "../builtin-skills";
 import { OAUTH_AUTH_KIND, type VendorOAuth } from "../oauth";
 import {
-  modelConfigFromModelsDev,
+  catalogModelConfigFor,
   type ModelsDevCatalog,
 } from "../models-dev-catalog";
-import type { HostProcess } from "../host-process";
 import type { Logger } from "../logger";
 import type { PluginRuntime } from "../plugin-runtime";
 import type { UserMcpRuntime } from "../user-mcp";
 import type { RuntimeState } from "./context";
 import type { RuntimeProvider } from "./provider-catalog";
+import type { LoadedSkillDocument } from "../skill-document";
+import { getActiveRemoteHostsBoot } from "../bootstrap/remote-hosts";
+import { loadRemoteWorkspaceInstructions } from "../remote/remote-workspace-instructions.js";
 
 const ErrorCodes = {
   ...SharedErrorCodes,
@@ -69,12 +70,8 @@ export type SessionLaunchRuntimeDependencies = {
     provider: Pick<RuntimeProvider, "models">,
     modelId: string,
   ) => ModelBinding | undefined;
-  modelsDevModelFor: (
-    provider: RuntimeProvider,
-    modelId: string,
-  ) => ReturnType<ModelsDevCatalog["findModel"]>;
   effectiveSubagentModelConfig: (
-    provider: Pick<RuntimeProvider, "models">,
+    provider: RuntimeProvider,
     modelId: string,
     catalogModelConfig: Parameters<typeof modelConfigWithBinding>[0],
   ) => {
@@ -96,7 +93,6 @@ export function createSessionLaunchRuntime({
   getWorkspacePath,
   pluginActiveInProject,
   bindingForModel,
-  modelsDevModelFor,
   effectiveSubagentModelConfig,
   normalizeThinkingLevel,
 }: SessionLaunchRuntimeDependencies) {
@@ -215,6 +211,26 @@ export function createSessionLaunchRuntime({
     }
   }
 
+  /** Built-in skill activation is host-owned and defaults on. */
+  async function disabledBuiltinSkills(): Promise<string[]> {
+    if (!runtimeState.host?.isAvailable()) {
+      throw new Error("host unavailable while reading built-in skill activation");
+    }
+    try {
+      const result = await runtimeState.host!.call<{ disabled: string[] }>(
+        "skills.disabledBuiltins",
+      );
+      return result.disabled ?? [];
+    } catch (error) {
+      if (!isHostUnavailable(error)) {
+        logger.app("plugin", "warn", "builtin skill state failed", {
+          data: String(error),
+        });
+      }
+      throw error;
+    }
+  }
+
   /**
    * Load one of the user's own skill documents by id, or `null` if there is no
    * such skill — so the caller can fall through to the plugin catalog.
@@ -226,7 +242,7 @@ export function createSessionLaunchRuntime({
   async function loadUserSkillBody(
     id: string,
     projectPath: string | null,
-  ): Promise<{ id: string; name: string; body: string } | null> {
+  ): Promise<LoadedSkillDocument | null> {
     if (!runtimeState.host || id.includes("/")) return null;
     const result = await runtimeState.host!.call<{
       skill: UserSkillRecord | null;
@@ -237,7 +253,7 @@ export function createSessionLaunchRuntime({
     if (!isActiveInProject(skill, projectPath)) {
       throw new Error(`skill "${id}" is not enabled for this project`);
     }
-    return { id: skill.id, name: skill.name, body: result.body };
+    return { id: skill.id, name: skill.name, body: result.body, location: skill.path };
   }
 
   async function resolveEffectiveCommandShell(): Promise<CommandShellCatalog> {
@@ -257,6 +273,25 @@ export function createSessionLaunchRuntime({
     return catalog;
   }
 
+  /**
+   * The worktree root of an isolated session, resolved by host-core from its
+   * own registry; `undefined` for every other session. A missing worktree
+   * fails the launch instead of silently falling back to the main checkout.
+   */
+  async function isolatedWorkspaceRoot(
+    sessionId: string,
+    session: { worktree?: unknown } | null | undefined,
+  ): Promise<string | undefined> {
+    if (!session?.worktree) return undefined;
+    if (!runtimeState.host) throw new Error("host unavailable");
+    const result = await runtimeState.host.call<{ path?: string }>("worktree.location", {
+      sessionId,
+    });
+    const root = typeof result.path === "string" ? result.path.trim() : "";
+    if (!root) throw new Error("isolated worktree location unavailable");
+    return root;
+  }
+
   async function resolveAgentRuntimeLaunch(
     sessionId: string,
     session: any,
@@ -271,11 +306,17 @@ export function createSessionLaunchRuntime({
   ) {
     if (!runtimeState.host) throw new Error("host unavailable");
     await modelsDevCatalog.ensureLoaded();
-    const commandShell = (await resolveEffectiveCommandShell()).effective!;
+    const remoteWorkspace = session.remoteWorkspace as { hostKey: string; path: string } | undefined;
+    const remoteBoot = remoteWorkspace ? getActiveRemoteHostsBoot() : null;
+    if (remoteWorkspace && !remoteBoot) throw new Error("remote host unavailable");
+    const commandShell = remoteWorkspace
+      ? await remoteBoot!.workspaceCommandShell(remoteWorkspace.hostKey)
+      : (await resolveEffectiveCommandShell()).effective!;
     const providers = await runtimeState.host!.call<{ providers: RuntimeProvider[] }>(
       "providers.list",
       { includeDisabled: false },
     );
+    for (const row of providers.providers) modelsDevCatalog.configureAccount(row);
     const requestedProviderId = overrides.providerId ?? session.providerId;
     const extensionAgentKey = requestedProviderId
       ? trustedExtensionAgentKeyFromProviderId(requestedProviderId)
@@ -288,7 +329,9 @@ export function createSessionLaunchRuntime({
           authKind: "none",
           extensionAgentKey,
         }
-      : providers.providers.find((item) => item.id === requestedProviderId) ||
+      : requestedProviderId
+        ? providers.providers.find((item) => item.id === requestedProviderId && item.enabled !== false)!
+        :
         providers.providers.find((item) => item.id === settings.defaultProviderId) ||
         providers.providers.find(
           (item) => item.hasSecret || item.hasOauth || item.authKind === "none",
@@ -299,6 +342,7 @@ export function createSessionLaunchRuntime({
         errorCode: ErrorCodes.MODEL_NOT_CONFIGURED,
       });
     }
+    modelsDevCatalog.configureAccount(provider);
     // Plugin-owned agents resolve credentials and transport inside the trusted
     // extension; the host never reads or injects a secret for them.
     const isExtensionAgent = Boolean(extensionAgentKey);
@@ -354,16 +398,15 @@ export function createSessionLaunchRuntime({
     const storedModel = bindingForModel(provider, modelId);
     const apiStyle = vendorBinding?.apiStyle ?? provider.apiStyle;
     const baseUrl = vendorBinding?.baseUrl ?? provider.baseUrl;
-    const modelsDevModel = modelsDevModelFor(provider, modelId);
     const catalogModelConfig = vendorBinding?.modelConfig ??
-      (modelsDevModel
-        ? modelConfigFromModelsDev(modelsDevModel, baseUrl)
-        : genericModelConfig(modelId, baseUrl ?? ""));
-    const resolvedLimits = resolveBindingContextWindow(catalogModelConfig, storedModel);
-    const modelConfig = modelConfigWithBinding(
-      resolvedLimits.catalogConfig,
-      resolvedLimits.binding,
-    );
+      catalogModelConfigFor(modelsDevCatalog, {
+        providerId: provider.id,
+        vendorKey: provider.vendorKey,
+        baseUrl,
+        apiStyle,
+        modelId,
+      });
+    const modelConfig = catalogModelConfig;
     const thinkingCapabilities = capabilitiesFromModelConfig(modelConfig);
     const thinkingLevel = clampThinkingLevel(
       thinkingCapabilities,
@@ -377,10 +420,25 @@ export function createSessionLaunchRuntime({
       typeof session.projectPath === "string" && session.projectPath.trim()
         ? session.projectPath.trim()
         : undefined;
-    let projectInstructions = await loadInstructionChain(projectPath);
+    const localInstructionRoot = remoteWorkspace ? undefined : projectPath;
+    // ADR 0329: an isolated session reads and writes files in its worktree.
+    // `projectPath` stays the project identity (memory, skills, plugins, MCP,
+    // subagents, group context); only files follow `workspaceRoot`. Remote
+    // workspaces are never isolated.
+    const workspaceRoot = remoteWorkspace
+      ? undefined
+      : await isolatedWorkspaceRoot(sessionId, session);
+    let projectInstructions = await loadInstructionChain(
+      remoteWorkspace ? undefined : (workspaceRoot ?? projectPath),
+    );
+    if (remoteWorkspace) {
+      projectInstructions = await loadRemoteWorkspaceInstructions(
+        remoteBoot!.workspaceFiles, remoteWorkspace, projectInstructions,
+      );
+    }
     // pi-compatible SYSTEM.md / APPEND_SYSTEM.md (issue #542): resolved once
     // per launch; a change retires the runtime through the reuse match.
-    const customSystemPrompt = await loadCustomSystemPrompt(projectPath);
+    const customSystemPrompt = await loadCustomSystemPrompt(localInstructionRoot);
     let projectMemory: string | undefined;
     if (projectPath) {
       try {
@@ -392,7 +450,9 @@ export function createSessionLaunchRuntime({
           } | null;
         }>("project.group.context", { path: projectPath });
         const groupRoots = result.context?.roots ?? [];
-        const groupRootGuide = groupRoots.length > 1
+        // An isolated session's root is its worktree; the group's other roots
+        // are outside it and are not advertised (ADR 0329).
+        const groupRootGuide = !workspaceRoot && groupRoots.length > 1
           ? [
               `Primary root: ${groupRoots[0]?.path ?? projectPath}`,
               ...groupRoots.slice(1).map((root) => `Additional root: ${root.path}`),
@@ -452,6 +512,7 @@ export function createSessionLaunchRuntime({
       ...builtinSkills({
         workspacePath: projectPath,
         pluginPaths: plugins.listLoaded().map((loaded) => loaded.path),
+        disabledIds: await disabledBuiltinSkills(),
       }),
       ...plugins
         .getSkills()
@@ -472,7 +533,7 @@ export function createSessionLaunchRuntime({
     // pinned model is resolved here because credentials and the models.dev catalog
     // live on this side. The user's own definitions (D202) are scope-filtered like the
     // skills above; a delegate the model can see is one it will try to call.
-    const subagentCatalog = await loadSubagentDefinitions(projectPath, {
+    const subagentCatalog = await loadSubagentDefinitions(localInstructionRoot, {
       userDocuments: await activeUserSubagentDocuments(projectPath),
       // A switched-off builtin is dropped from what this prompt may delegate to.
       disabledBuiltins: await disabledBuiltinSubagents(),
@@ -485,14 +546,13 @@ export function createSessionLaunchRuntime({
       resolveVendorBinding: (pinned, pinnedModelId) =>
         vendorOAuth.bindingFor(pinned.id, pinnedModelId),
       resolveModel: async (pinned, pinnedModelId) => {
-        const model = modelsDevCatalog.findModel({
+        const catalogModelConfig = catalogModelConfigFor(modelsDevCatalog, {
+          providerId: pinned.id,
           vendorKey: pinned.vendorKey,
           baseUrl: pinned.baseUrl,
+          apiStyle: pinned.apiStyle,
           modelId: pinnedModelId,
         });
-        const catalogModelConfig = model
-          ? modelConfigFromModelsDev(model, pinned.baseUrl)
-          : genericModelConfig(pinnedModelId, pinned.baseUrl ?? "");
         const configuredProvider = providers.providers.find(
           (candidate) => candidate.id === pinned.id,
         );
@@ -548,16 +608,21 @@ export function createSessionLaunchRuntime({
           const vb = await vendorOAuth.bindingFor(row.id, binding.id);
           if (!vb) continue;
           catalogModelConfig =
-            vb.modelConfig ?? genericModelConfig(binding.id, vb.baseUrl ?? row.baseUrl ?? "");
+            vb.modelConfig ?? catalogModelConfigFor(modelsDevCatalog, {
+              providerId: row.id,
+            vendorKey: row.vendorKey,
+              baseUrl: vb.baseUrl ?? row.baseUrl,
+              apiStyle: vb.apiStyle ?? row.apiStyle,
+              modelId: binding.id,
+            });
         } else {
-          const model = modelsDevCatalog.findModel({
+          catalogModelConfig = catalogModelConfigFor(modelsDevCatalog, {
+            providerId: row.id,
             vendorKey: row.vendorKey,
             baseUrl: row.baseUrl,
+            apiStyle: row.apiStyle,
             modelId: binding.id,
           });
-          catalogModelConfig = model
-            ? modelConfigFromModelsDev(model, row.baseUrl)
-            : genericModelConfig(binding.id, row.baseUrl ?? "");
         }
         const effective = effectiveSubagentModelConfig(
           row,
@@ -611,22 +676,43 @@ export function createSessionLaunchRuntime({
             : [],
         ),
     );
+    const mode = normalizeMode(
+      overrides.mode ?? session.mode ?? settings.defaultMode ?? "agent",
+    );
+    let jevApiKey: string | undefined;
+    if (mode === "agent" && settings.jevEnabled === true) {
+      try {
+        const saved = await runtimeState.host!.call<{ value?: string | null }>(
+          "secrets.getForRuntime",
+          { secretRef: JEV_API_KEY_SECRET_REF },
+        );
+        if (typeof saved.value === "string" && saved.value.trim().length > 0) {
+          jevApiKey = saved.value;
+        }
+      } catch {
+        logger.app("session", "warn", "Jev API key could not be loaded", {
+          sessionId,
+        });
+      }
+    }
     return {
       providerId: provider.id,
       modelId,
       projectPath,
+      workspaceRoot,
       sidecarParams: {
         sessionId,
-        mode: normalizeMode(
-          overrides.mode ?? session.mode ?? settings.defaultMode ?? "agent",
-        ),
+        mode,
         ...(overrides.turnId ? { turnId: overrides.turnId } : {}),
         thinkingLevel,
         infiniteProviderRetry: settings.infiniteProviderRetry === true,
+        ...(jevApiKey ? { jevApiKey } : {}),
         commandShell,
         scratchDir: join(dataDir, "scratch", sessionId),
         attachmentsDir: join(dataDir, "attachments"),
         projectPath,
+        ...(remoteWorkspace ? { remoteWorkspace } : {}),
+        ...(workspaceRoot ? { workspaceRoot } : {}),
         customSystemPrompt,
         projectInstructions,
         projectMemory,
@@ -665,6 +751,7 @@ export function createSessionLaunchRuntime({
             })),
           ...userMcpTools.map((tool) => ({
             name: tool.fullName,
+            mcpServerId: tool.serverId,
             description: tool.description,
             parameters: tool.schema ?? { type: "object", properties: {} },
           })),
@@ -696,6 +783,7 @@ export function createSessionLaunchRuntime({
     activeUserSkills,
     activeUserSubagentDocuments,
     disabledBuiltinSubagents,
+    disabledBuiltinSkills,
     loadUserSkillBody,
     resolveEffectiveCommandShell,
     resolveAgentRuntimeLaunch,

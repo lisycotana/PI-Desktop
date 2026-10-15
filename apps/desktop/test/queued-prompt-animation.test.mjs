@@ -4,7 +4,7 @@ import {
   readSharedTypesSource,
 } from "./helpers/source-contracts.mjs";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 import { loadStyles } from "./helpers/styles.mjs";
 
@@ -134,5 +134,23 @@ test("every shipped catalog carries the animation keys", () => {
     assert.match(source, /queuedPromptAnimationBubbles"?:/);
     assert.match(source, /queuedPromptAnimationGlow"?:/);
     assert.match(source, /queuedPromptAnimationWave"?:/);
+  }
+});
+
+test("newly shipped locales include the animation options", async () => {
+  const locales = new URL("../../../packages/i18n/src/locales/", import.meta.url);
+  for (const entry of await readdir(locales, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const source = await readFile(new URL(`${entry.name}/index.ts`, locales), "utf8");
+    for (const key of [
+      "queuedPromptAnimation",
+      "queuedPromptAnimationDesc",
+      "queuedPromptAnimationOff",
+      "queuedPromptAnimationBubbles",
+      "queuedPromptAnimationGlow",
+      "queuedPromptAnimationWave",
+    ]) {
+      assert.match(source, new RegExp(`\\b${key}"?:`), `${entry.name}: ${key}`);
+    }
   }
 });

@@ -7,10 +7,11 @@ import type {
 import {
   contextCompactionMark,
   initialThinkingLevelForBinding,
-  modelIdsMatch,
+  initialThinkingLevelForUnmatchedModel,
   normalizeMode,
 } from "@pi-desktop/shared";
 import { api } from "../../lib/api";
+import { sameComposerModelId } from "../../lib/composer-models";
 import { scheduleHomeDraftAdopt } from "../../lib/composer-draft-cache";
 import {
   commitForkedSessionState,
@@ -36,6 +37,8 @@ export type PersistSessionOptions = {
   intent?: number;
   projectPath?: string | null;
   draftConfiguration?: DraftSessionConfiguration | null;
+  /** Run the new session in its own git worktree (ADR 0329). */
+  isolated?: boolean;
 };
 
 export type SessionCoordination = {
@@ -154,7 +157,7 @@ export function createSessionCoordination({
     const records =
       session?.compactions ??
       (session?.compaction ? [session.compaction] : []);
-    const marks = records.map(contextCompactionMark);
+    const marks = records.map((record) => ({ ...contextCompactionMark(record), summary: record.summary }));
     set((state) => ({
       sessionCompactions:
         marks.length > 0
@@ -202,6 +205,7 @@ export function createSessionCoordination({
     });
     rememberSessionCompactions(summary.id, session);
     void get().restorePendingPlan(summary.id);
+    void get().restorePendingInteractive(summary.id);
   }
 
   function revealEmptyCreatingSession(intent: number): void {
@@ -284,17 +288,28 @@ export function createSessionCoordination({
       draft: draftConfig,
       settings,
       providers: state.providers,
+      recentModels: state.recentModels,
     });
     const defaultProvider = state.providers.find(
       (provider) => provider.id === inherited.providerId,
     );
     const inheritedBinding = defaultProvider?.models.find((candidate) =>
-      modelIdsMatch(candidate.id, inherited.modelId ?? ""),
+      sameComposerModelId(candidate.id, inherited.modelId ?? ""),
     );
-    const defaultThinkingLevel = initialThinkingLevelForBinding(
-      inheritedBinding,
-      defaultProvider?.supportedThinkingLevels,
-    );
+    const catalogModel = inherited.providerId && inherited.modelId
+      ? state.providerModels[inherited.providerId]?.find((candidate) =>
+          sameComposerModelId(candidate.modelId, inherited.modelId ?? ""),
+        )
+      : undefined;
+    const defaultThinkingLevel = catalogModel?.catalogSource === "models.dev"
+      ? initialThinkingLevelForBinding(
+          inheritedBinding,
+          defaultProvider?.supportedThinkingLevels,
+        )
+      : initialThinkingLevelForUnmatchedModel(
+          inheritedBinding,
+          defaultProvider?.supportedThinkingLevels,
+        );
     const previousSessionId = state.activeSessionId;
     revealEmptyCreatingSession(active);
     let created: Awaited<ReturnType<typeof api.createSession>>;
@@ -307,6 +322,7 @@ export function createSessionCoordination({
         providerId: inherited.providerId,
         modelId: inherited.modelId,
         projectPath: projectPath ?? undefined,
+        ...(options.isolated ? { isolated: true } : {}),
       });
     } catch (error) {
       if (previousSessionId && runtime.navigationIntentIsCurrent(active)) {

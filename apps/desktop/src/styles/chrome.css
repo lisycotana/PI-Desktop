@@ -187,6 +187,90 @@
   }
 }
 
+/*
+ * Startup recovery — the surface the startup watchdog falls back to when the
+ * renderer never receives its initial state (issue #831).
+ *
+ * It sits above the splash and is opaque by design: the window has no data to
+ * show, so there is nothing behind it worth seeing. Unlike the splash it must be
+ * operable — every control on it works without any backend — so it is draggable
+ * like the splash while its action row opts back out.
+ */
+.startup-recovery {
+  position: fixed;
+  inset: 0;
+  z-index: 1400; /* above the splash (1300) it replaces */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--ds-bg-primary);
+  -webkit-app-region: drag;
+  animation: startup-splash-in var(--motion-duration-slow) var(--motion-ease-out) both;
+}
+
+/*
+ * The renderer-drawn window controls (Windows/Linux, no native chrome) are
+ * hidden until the shell is ready, so a window sitting on this surface would
+ * have no close control at all. Keep them above it: the surface's own Quit
+ * action must not be the only way out of a stuck startup.
+ */
+.app-shell:has(> .startup-recovery) > .window-controls {
+  z-index: 1500;
+}
+
+.startup-recovery-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: min(100%, 420px);
+  text-align: center;
+  -webkit-app-region: no-drag;
+}
+
+.startup-recovery-mark {
+  display: flex;
+  width: 56px;
+  height: 56px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--ds-composer-radius);
+  background: var(--ds-tile-deep);
+}
+
+.startup-recovery-title {
+  margin: 0;
+  color: var(--ds-text-primary);
+  font-size: var(--text-lg);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--leading-tighter);
+}
+
+.startup-recovery-body {
+  margin: 0;
+  color: var(--ds-text-secondary);
+  font-size: var(--text-md);
+  line-height: var(--leading-body);
+  overflow-wrap: anywhere;
+}
+
+.startup-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .startup-recovery {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+  }
+}
+
 .sidebar-surface,
 .sidebar-rail {
   background-color: var(--ds-bg-sidebar, var(--ds-bg-primary));
@@ -509,6 +593,45 @@
   line-height: var(--leading-compact);
 }
 
+/*
+ * Where a scheduled run's conversation was opened from: the session list keeps
+ * automation transcripts out of the project groups, so this is the way back to
+ * the task and the run the reader was reading. It sits in the title's own lane,
+ * so a long task title truncates exactly as it did before.
+ */
+.conversation-topbar .ct-back {
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  height: 24px;
+  align-items: center;
+  gap: 2px;
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 0 8px 0 4px;
+  background: transparent;
+  color: var(--ds-text-secondary);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  transition: background var(--motion-duration-fast) var(--motion-ease-out),
+    color var(--motion-duration-fast) var(--motion-ease-out);
+}
+
+.conversation-topbar .ct-back:hover {
+  background: var(--ds-bg-hover);
+  color: var(--ds-text-primary);
+}
+
+.conversation-topbar .ct-back-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  line-height: var(--leading-compact);
+}
+
 /* One geometry and one seat for every chrome icon control: the topbar's dock
    toggle, the viewport-fixed work-panel toggle, the preview/route-band lane
    actions, and the work-panel header's create and maximize controls. The seat is
@@ -735,7 +858,7 @@
   border: 2px solid var(--ds-bg-sidebar);
   border-radius: var(--radius-full);
   background: var(--ds-error);
-  color: var(--gray-0);
+  color: var(--ds-bg-primary);
   font-size: var(--text-3xs);
   font-weight: var(--font-weight-semibold);
   line-height: var(--leading-none);
@@ -1003,13 +1126,13 @@
 
 /* Electron resolves app-region hit testing across siblings. The controls must
  * be a later compositor layer than Settings, plugin content, or a work-panel
- * drag header. Direct-child overlays (search, toasts, splash) must still win. */
+ * drag header. Direct-child overlays (search, splash) must still win; the toast
+ * stack is not one of them — it lives on the body so a dialog cannot cover it. */
 .app-shell > .window-controls {
   z-index: 1100;
 }
 
-.app-shell > .search-overlay,
-.app-shell > .toast-viewport {
+.app-shell > .search-overlay {
   z-index: 1200;
 }
 
@@ -1018,7 +1141,7 @@
 }
 
 /* Follow the adjacent titlebar surface when the dock occupies the right edge. */
-.app-shell:has(> .work-panel) > .window-controls {
+.app-shell:has(.work-panel) > .window-controls {
   background: var(--ds-bg-dock-raised);
 }
 
@@ -1044,7 +1167,7 @@
 }
 
 .window-control-btn.window-control-close:hover {
-  color: var(--gray-0);
+  color: var(--ds-bg-primary);
   background: var(--ds-error);
 }
 
@@ -1141,7 +1264,7 @@
 
 /* Match the scenic backdrop's child-layer specificity so preview navigation
  * stays above the work panel while non-control pixels remain pass-through. */
-.app-shell > .window-chrome-row {
+.app-shell > :where(.app-chat-shell) > .window-chrome-row {
   position: absolute;
   top: 0;
   right: 0;

@@ -5,6 +5,8 @@
 - Deciders: PI-Desktop runtime maintainers
 - Amends: ADR 0049 (decision 1, the preflight guard; the "retry indefinitely"
   rejection stands), D203 / ADR 0064 (the summary family only)
+- Amended by: ADR 0302 (a prompt that still does not fit after the reduced pass
+  is summarized in chunks; only a range the planner cannot split falls back)
 - Related: issue #543 · PR #554 (superseded) ·
   [03-runtime/02-agent-runtime](../spec/03-runtime/02-agent-runtime.md) ·
   [03-runtime/01-ipc-protocol](../spec/03-runtime/01-ipc-protocol.md) ·
@@ -103,6 +105,15 @@ summary request and is untouched.
   `summary ≈112 tokens` will now see the failure label on the same rows,
   including historical ones, because the mark is derived from persisted
   details on session open.
+
+### Implementation note (2026-10-03)
+
+The retry, sizing, reduction, and chunking contract remains unchanged. The
+summary request adapter and conversation serializer are now owned by
+`packages/agent-runtime` because pi-agent-core removed its experimental harness
+exports. The desktop adapter still uses pi-ai `completeSimple` and the same
+retry policy. See
+`docs/spec/02-architecture/06-pi-runtime-dependency-boundary.md`.
 
 ## Alternatives
 

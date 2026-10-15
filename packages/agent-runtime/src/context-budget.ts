@@ -6,15 +6,15 @@
  * requests the parent already considers unsafe. Both therefore read the
  * formula from here instead of each owning a copy that can drift.
  *
- * Deliberately dependency-light — token estimation is delegated to
- * pi-agent-core and nothing else is imported, so this module stays usable from
- * any runtime context and can never form a cycle with `runtime.ts`.
+ * Deliberately dependency-light — token estimation uses the pi-ai utility
+ * boundary through the desktop-owned compatibility adapter, so this module
+ * stays usable from any runtime context and can never form a cycle with
+ * `runtime.ts`.
  */
 
-import {
-  estimateContextTokens,
-  type AgentMessage,
-} from "@earendil-works/pi-agent-core";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { estimateContextTokens } from "./pi-runtime-estimates.js";
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
@@ -42,12 +42,12 @@ export const COMPACTION_MAX_KEEP_RECENT_TOKENS = 64_000;
  */
 export const COMPACTION_RETAINED_USER_MESSAGE_MAX_TOKENS = 20_000;
 
-/**
- * Context thresholds derived from the active model's window.
+/** Context limits derived from the active model's window.
  *
  * `hardLimit` is the safety boundary: the next provider request must not be
- * issued while the context is at or above it. Compaction happens inline at that
- * boundary, the way Codex does it — there is no off-critical-path variant.
+ * issued while the context is at or above it. Automatic compaction starts at
+ * 90% of that budget, inline at the next turn boundary; there is no
+ * off-critical-path variant.
  */
 export type ContextBudget = {
   /** Estimated tokens in the reconstructed model context. */
@@ -60,6 +60,19 @@ export type ContextBudget = {
   keepRecentTokens: number;
 };
 
+/** Fraction of the safe request budget that starts automatic compaction. */
+export const AUTO_COMPACTION_TRIGGER_RATIO = 0.9;
+
+/**
+ * Start compaction before the hard boundary so estimator drift and one-turn
+ * growth do not leave the provider request as the first overflow detector.
+ */
+export function automaticCompactionThresholdFor(
+  budget: Pick<ContextBudget, "hardLimit">,
+): number {
+  return Math.max(1, Math.floor(budget.hardLimit * AUTO_COMPACTION_TRIGGER_RATIO));
+}
+
 /**
  * The only model facts the budget depends on. Kept structural and optional so a
  * pi-ai `Model` passes directly, while a catalog entry that never reported a
@@ -69,6 +82,13 @@ export type ContextBudgetModel = {
   contextWindow?: number;
   maxTokens?: number;
 };
+
+/**
+ * Estimation input. A full pi-ai `Model` additionally carries the replay
+ * identity (`api`/`provider`/`id`) that hosted-search token estimation needs,
+ * which is why it is named on its own next to the partial window facts above.
+ */
+export type ContextBudgetModelInput = ContextBudgetModel | Model<Api>;
 
 /** Thresholds only, for callers that already know their own token count. */
 export type ContextBudgetLimits = Omit<ContextBudget, "tokens">;
@@ -117,13 +137,32 @@ export function contextBudgetLimitsFor(
   return { hardLimit, requestHeadroom, keepRecentTokens };
 }
 
+/**
+ * Token estimate of `messages` as the target model will carry them.
+ *
+ * Hosted search is model-dependent: the Responses adapter replays a
+ * `web_search_call` only for the model that produced it, so `api` is the
+ * discriminant that says whether a target model is known at all. A caller with
+ * partial model facts (a catalog entry, a caller test) has no target and keeps
+ * the conservative estimate — every search block is charged rather than
+ * assumed away.
+ */
+function estimateContextTokensFor(
+  model: ContextBudgetModelInput,
+  messages: AgentMessage[],
+): ReturnType<typeof estimateContextTokens> {
+  return "api" in model
+    ? estimateContextTokens(messages, model)
+    : estimateContextTokens(messages);
+}
+
 /** Thresholds for a model window, plus the estimated size of `messages`. */
 export function contextBudgetFor(
-  model: ContextBudgetModel,
+  model: ContextBudgetModelInput,
   messages: AgentMessage[],
 ): ContextBudget {
   return {
-    tokens: estimateContextTokens(messages).tokens,
+    tokens: estimateContextTokensFor(model, messages).tokens,
     ...contextBudgetLimitsFor(model),
   };
 }

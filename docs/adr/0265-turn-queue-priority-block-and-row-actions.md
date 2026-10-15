@@ -30,12 +30,21 @@ queue at all even though the Host already orders it by a durable `position`.
    already carries a `priority` fails with `CONFLICT`/`ALREADY_PRIORITIZED`
    instead of silently moving it again. `session.queuePrioritize` keeps moving
    optimistic mirror does the same.
-3. **A promoted row is locked.** Because the Host has already committed to
-   starting it, its row disables move up, move down, edit, and remove, and its
-   Send now button reads as decided (`chat.sendNowPending`). The disabled
-   controls keep their tooltip and `aria-disabled` state so the lock is
-   explained rather than silent. There is deliberately no un-promote path: a
-   promotion cannot be half-applied.
+3. **Promotion fixes order, but does not prevent cancellation.** A promoted
+   row disables move up, move down, edit, and Send now. Its label is Waiting to
+   send. Remove remains available until delivery, and the renderer waits for
+   Host confirmation before removing it.
+   Cancellation, promotion, reordering, and delivery reservation share session
+   admission serialization. Runtime delivery runs outside that lock and reserves
+   only its own input. Once an input is reserved or accepted as steering input,
+   cancellation returns `CONFLICT`; consuming an input in another turn must
+   not be mistaken for an earlier successful cancellation. Refused steering
+   retains the queued input for the next turn. There is no un-promote path.
+   Acceptance is recorded before durable cleanup; failed cleanup
+   emits an error and remains retryable without re-execution in the live Host.
+   The queue retains its record when persistence fails. Acceptance is an in-memory
+   guard, not a durable receipt: restart after failed cleanup retains the existing
+   replay risk and does not provide exactly-once delivery.
 4. **A reorder operation for the plain queue.** `session.queueReorder` swaps one
    entry's `position` with its adjacent non-prioritized neighbour in the
    requested direction, and reports `moved: false` for a missing entry, a
@@ -50,17 +59,18 @@ queue at all even though the Host already orders it by a durable `position`.
    refused with a toast while the input is non-empty, and the emptiness check
    runs against the live editor read because the draft cache is not written per
    keystroke.
-6. **The promoted block is delivered as adjacent messages, not as separate
-   turns.** Promotion still does not touch the running turn by itself: the
-   renderer requests the existing graceful `agent/stop`, and the block leaves at
-   the next boundary. The first promoted entry then starts the turn, and every
-   later promoted entry is injected into that same turn as user input over the
-   Composer's existing steering channel. The transcript therefore reads
-   `user: first`, `user: second` and the model answers once. The injection is
-   retried a bounded number of times because the runtime only accepts input for
-   a live run; an entry that is still undelivered stays queued and leaves at the
-   next boundary as its own turn, which is the previous behavior and never a
-   lost prompt. An injected entry's own RACP turn is canceled: its input was
+6. **The promoted block is delivered into the active turn.** Promotion uses
+   steering so the parent handles user input while delegates keep working
+   (issue #1607). An active `TaskWait` yields to accepted steering; ordinary
+   tools keep their normal boundaries. Immediate delivery accepts only the
+   paired caller's own input with the active turn's permission mode. External
+   Desktop turns use the stored session mode; module-admitted turns use their
+   principal-specific ceiling. Other input retains turn-boundary delivery.
+   When there is no active turn, the first promoted entry starts the turn and
+   later promoted entries join it as steering input, in click order.
+   Runtime refusals are retried within a bounded budget. Undelivered input
+   remains queued for its own turn at the next boundary.
+   An injected entry's own RACP turn is canceled: its input was
    delivered by another turn, and no client may be left believing it is still
    waiting.
 7. **The turn's owner is authoritative about its end.** A runtime terminal event

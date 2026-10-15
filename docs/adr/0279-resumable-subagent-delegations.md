@@ -70,7 +70,12 @@ A new module (`packages/agent-runtime/src/delegation-history.ts`) owns:
 - synthesizing the original `task` as the first user message from the first
   `Task` tool row's persisted arguments,
 - converting to `AgentMessage[]` with the delegate's own provider/model binding
-  (a pinned delegation model is not the session model),
+  (a pinned delegation model is not the session model). Assistant transport
+  identity is `model.provider` / `model.id` — the same values live requests
+  use — not the account row id. When `vendorKey` is set, `model.provider`
+  differs from `provider.id`; tagging restored history with the account id
+  makes pi-ai treat same-model reasoning as foreign and empty
+  `reasoning_content` on resume,
 - a read-file / line-count budget gate.
 
 `SubagentRun` gains `initialMessages?: AgentMessage[]`; when present it seeds
@@ -100,7 +105,10 @@ same unknown-id error, because the model's only correct action is identical.
 
 A resume keeps the chain's own model binding. The `providerId/modelId` key the
 chain recorded is preferred; a chain rebuilt from the transcript only knows the
-model id, which is matched against what the session has configured. Changing the
+model id, which is matched only against the current definition's pin/fallbacks,
+the session binding, and currently authorized overrides. A remembered key whose
+turn grant expired is reauthorized before use; a denied key cannot select another
+account by model id. Other definitions' private pins are never candidates (#841). Changing the
 parent's own session model therefore does not strand a chain, and a delegate never
 swaps models by accident. If nothing resolves the recorded binding any more, the
 run continues on the binding the definition resolves to now and records the
@@ -112,8 +120,11 @@ the same conversation to a different model with no trace.
 
 A `failed` run's reads and findings still have value; its failed assistant row
 is dropped by the converter like any other error row. `stopped` and `aborted`
-encode the user's or the parent's decision to abandon that line of work, and
-resuming it would contradict the stop. `interrupted` (the app closed while the
+encode an explicit Stop or runtime disposal, and resuming it would contradict
+the cancellation. A terminal parent error still cancels active execution, but
+its interrupted delegates settle as `failed` with `SUBAGENT_PARENT_FAILED`
+instead: this system interruption preserves manual resume eligibility (#680).
+`interrupted` (the app closed while the
 run still worked) means the same thing for this purpose: the delegate never
 settled, so there is nothing trustworthy to continue. (`timed_out` is a vestigial
 status — ADR 0119's timeouts were withdrawn by D328 — and is treated as `failed`

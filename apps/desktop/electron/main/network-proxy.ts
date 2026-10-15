@@ -25,6 +25,11 @@ import {
   startAuthenticatedProxyRelay,
   type AuthenticatedProxyRelay,
 } from "@pi-desktop/agent-runtime";
+import { applyUserEndpointPolicyFromAppSettings } from "./endpoint-policy";
+import {
+  startSystemProxyRelay,
+  type SystemProxyRelay,
+} from "@pi-desktop/agent-runtime/system-proxy-relay";
 
 const originalEnv = snapshotProxyEnv(process.env);
 let applied: NetworkProxySettings = { mode: "system" };
@@ -32,6 +37,36 @@ let fetchPatched = false;
 let sessionHookInstalled = false;
 let activeRelay: AuthenticatedProxyRelay | null = null;
 let relayUpstreamHref: string | null = null;
+let systemProxyRelay: SystemProxyRelay | null = null;
+let systemProxyRelayStart: Promise<SystemProxyRelay> | null = null;
+
+export async function ensureSystemProxyRelay(): Promise<string> {
+  if (!systemProxyRelay) {
+    const starting =
+      systemProxyRelayStart ??
+      (systemProxyRelayStart = startSystemProxyRelay((url) =>
+        session.defaultSession.resolveProxy(url),
+      ));
+    try {
+      systemProxyRelay = await starting;
+    } finally {
+      if (systemProxyRelayStart === starting) systemProxyRelayStart = null;
+    }
+  }
+  return systemProxyRelay.url;
+}
+
+export function currentSystemProxyRelayUrl(): string | null {
+  return systemProxyRelay?.url ?? null;
+}
+
+export async function disposeSystemProxyRelay(): Promise<void> {
+  const pending = systemProxyRelayStart;
+  const relay = systemProxyRelay ?? (pending ? await pending : null);
+  systemProxyRelay = null;
+  if (systemProxyRelayStart === pending) systemProxyRelayStart = null;
+  await relay?.close();
+}
 
 export function currentNetworkProxy(): NetworkProxySettings {
   return applied;
@@ -78,6 +113,9 @@ export async function applyNetworkProxy(
 export async function applyNetworkProxyFromAppSettings(
   settings: unknown,
 ): Promise<NetworkProxySettings> {
+  // The network policy and the proxy ride the same settings write, so one call
+  // site mirrors both.
+  applyUserEndpointPolicyFromAppSettings(settings);
   const record =
     settings && typeof settings === "object"
       ? (settings as { networkProxy?: unknown })

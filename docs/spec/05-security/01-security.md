@@ -24,7 +24,9 @@ Required (all **implemented**):
   forwards only parsed `http:` / `https:` / `mailto:` URLs to the OS browser
   (`parseAllowedExternalUrl`, D330 / ADR 0168). `file:`, `javascript:`,
   `data:`, and custom URI schemes never reach `shell.openExternal`.
-  `will-navigate` blocks all non-dev-server navigations
+  `will-navigate` is enforced by each owning surface; the embedded Browser
+  permits HTTP(S), workspace file links, and local-file navigation initiated
+  from an already loaded local file, while other schemes remain blocked.
 - Every web contents Electron creates starts with a deny-all window-open
   handler and a blocked `<webview>` attach (`app.on("web-contents-created")`);
   the owning surface replaces the handler with its own policy, so a window
@@ -37,6 +39,15 @@ Required (all **implemented**):
   render, without a click. This is a deliberate readability trade-off: a
   reply can therefore reveal the user's IP to the host it names. Links never
   navigate in-app and always route through the external-open path.
+
+### Embedded Browser local files
+
+The embedded Browser can open any existing local file explicitly entered as an
+absolute path or `file:` URL. A loaded local file can navigate to other existing
+local files. A web page can still navigate to workspace files as before, but
+cannot use a file link to escape the workspace. This local-file browsing is
+covered by the high-risk `browser.cdp` capability; `BrowserPreview` and the
+sidecar's workspace file resolver remain restricted to the session workspace.
 
 ### Content Security Policy
 
@@ -96,6 +107,13 @@ and byte size, and only then creates the `plan_approvals` record with
 structured title/question fields. Renderer and sidecar state cannot write or
 replace an artifact.
 
+Tools from user-configured MCP servers (`mcp_<serverId>_<tool>`) are never
+low-risk by default: host-core classifies them `medium` and ignores any risk
+level the MCP server declares for itself. `ask` and `accept-edits` require
+approval (an `allow-session` grant covers the same tool name for the rest of
+that session, in memory only), `auto` auto-allows, and Plan/Goal still deny
+them (D640, ADR `mcp-tool-approval-risk`).
+
 ## 4.1 Skill market egress
 
 The renderer does not fetch skill catalogs or SKILL.md documents. Electron
@@ -106,13 +124,21 @@ request will actually take. Before each hop the client asks the session that
 carries `net.fetch` for its own proxy decision (`Session.resolveProxy`): on a
 proxied route the hop is judged on its route rather than on a local address the
 app would never dial, so only the resolver-artifact class (`benchmark`, a TUN
-fake-IP) is tolerated there, while a direct or unreadable route keeps the full
-local classification and rejects loopback, RFC1918, ULA, link-local, mapped
-IPv6, and every other non-public class by default. The explicit `allowFakeIp`
-setting may additionally permit only the `benchmark` placeholder for a
-transparent router/TUN deployment. Install writes markdown only through
+fake-IP) is tolerated there. A direct route rejects non-public answers when
+none of the DNS results is acceptable; if a mixed answer contains an acceptable
+public address, Main pins the request to that address and never connects to the
+rejected result (ADR 0321). The explicit `allowFakeIp` setting may additionally
+permit only the `benchmark` placeholder for a transparent router/TUN deployment,
+and only an accepted address is pinned. ULA-only answers and every other
+non-public-only result remain blocked. Install writes markdown only through
 `skills.create`. The host document cap remains 128 KiB after sibling markdown
 is inlined.
+
+A source URL the user typed is judged by ADR 0304 instead: it may be a loopback
+or LAN catalog, and plain `http` to it is allowed because the relaxed network
+mode is on by default (`networkPolicy.mode`). Every document URL that arrives
+*inside* a catalog, and every redirect target, keeps the public-only policy
+above, in either mode.
 
 ## 4.2 MCP market egress
 
@@ -133,6 +159,44 @@ redirects do not forward caller headers.
 
 Manual user-owned MCP configuration remains covered by ADR 0142 and may use
 explicit local/LAN endpoints; the market path does not widen that policy.
+
+
+A market source URL the user typed is judged by ADR 0304 as well: it may be a
+loopback or LAN endpoint, with plain `http` behind the relaxed network mode
+(`networkPolicy.mode`, on by default). Everything a source returns —
+registry records, catalog bodies, redirect targets — keeps the public-only
+policy above.
+
+## 4.3 Portable configuration sync
+
+S3 configuration backup/sync is a Host Core network boundary. The renderer
+supplies connection secrets and the vault password only as transient IPC
+inputs, receives redacted status, and never owns the transport or vault key.
+Agent Runtime has no sync implementation. Host validates origin-only endpoints,
+rejects redirects and public plaintext HTTP, constrains paths, bounds streamed
+objects and KDF parameters, and requires strong conditional writes. LAN HTTP
+follows the shared relaxed network policy. There is no WebDAV or append-only
+fallback; only GET 404 is absence, never 403 or 502.
+
+Vault contents are authenticated ciphertext. S3 never receives the backup
+password or machine key. SigV4 uses scoped S3 credentials; bucket identity,
+request timing and object sizes remain visible. Credential export and import
+require opt-in. Raw exported secrets are absent from status, preview, conflict
+labels and logs. Provider/MCP secrets use the Host secret store; OAuth sessions
+and cookies are not portable. The local secret store uses encrypted files plus
+a colocated `.machine-key`, not an OS Keychain backend.
+
+Imported commands, endpoints, scripts, skills, plugins, and automations are
+staged behind a digest-bound local approval. Local paths and approvals are
+overlays, not shared entities. A new device therefore cannot execute a
+synchronized capability merely because its desired enabled flag was imported.
+Both operating modes preserve approval and mapping requirements. A backup run
+does not apply remote configuration. Password rewrapping does not revoke
+previously unlocked devices. Immutable objects are retained indefinitely; a
+30-entry history index is not a cloud storage limit. A server can still deny
+service or replay an old valid head to a fresh device with no trusted history.
+Per-file atomic replacement and import journaling do not constitute a
+whole-filesystem transaction.
 
 ## 5. Command execution
 
@@ -180,27 +244,23 @@ explicit local/LAN endpoints; the market path does not widen that policy.
 - Feed manifests bind artifacts with electron-builder hashes. An error,
   unavailable feed, hash mismatch, or invalid updater state must not install.
 - Packaged macOS, Windows NSIS, and Linux AppImage download and install in-app
-  from the GitHub Releases feed. Linux deb/rpm and Windows portable detect a
-  release and open the fixed releases page.
+  from the GitHub Releases feed. Linux deb/rpm and Windows ZIP detect a
+  release and open the fixed releases page. Legacy Windows portable
+  executables remain manual when `PORTABLE_EXECUTABLE_FILE` is present.
 - D126 tag releases publish Windows NSIS and Linux AppImage installers with
   their update manifests, plus Linux deb/rpm packages and a Windows portable
-  exe. The NSIS and AppImage artifacts activate the existing in-app lanes.
-  The portable exe uses notify-and-link delivery and does not write
+  ZIP. The NSIS and AppImage artifacts activate the existing in-app lanes.
+  The portable ZIP uses notify-and-link delivery and does not write
   `latest.yml`. macOS tag artifacts are Developer ID-signed, notarized, and
   stapled before upload; rollback and staged-rollout qualification remain
   release follow-ups.
 - The client carries no GitHub token. A private or otherwise unreachable feed
   fails closed; automatic failures stay ambient and explicit checks expose the
   error.
-- Unsigned macOS distributions keep a narrow first-launch fallback for trusted
-  sources. The DMG is a two-icon install and does not include that note. The ZIP
-  package includes a text note and the executable helper, which searches only
-  `/Applications/PI-Desktop.app` and `~/Applications/PI-Desktop.app`,
-  verifies `CFBundleIdentifier` is `net.aiuo.pi-desktop`, removes only
-  `com.apple.quarantine` recursively when present, and opens the app. It accepts
-  no arbitrary path, uses no privilege escalation, and is not a substitute for
-  Developer ID signing or notarization. The note gives the manual
-  `com.apple.quarantine` command and says signed/notarized builds do not need it.
+- Neither macOS DMG nor ZIP ships first-launch guidance or an executable
+  quarantine-clearing helper. GitHub tag artifacts remain Developer ID-signed,
+  notarized, and stapled; opt-in unsigned builds are debug artifacts and do not
+  imply Gatekeeper qualification.
 - Localized product "what's new" text (D164/D345) is selected in Main from the
   shipped changelog catalog and attached to `UpdateState.releaseNotes`. The
   renderer cannot supply a notes URL, feed, or remote body; missing catalog

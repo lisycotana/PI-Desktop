@@ -9,7 +9,9 @@ import {
   proxyEnvAssignments,
   proxyHasCredentials,
   redactProxyUrl,
+  resolveCustomProxyUrl,
   restoreProxyEnv,
+  settingsForInactiveProxyMode,
   snapshotProxyEnv,
   stripProxyEnv,
   validateNetworkProxy,
@@ -66,20 +68,40 @@ describe("parseProxyUrl", () => {
 });
 
 describe("validateNetworkProxy", () => {
-  it("defaults unknown values to system and drops custom URL for non-custom modes", () => {
+  it("defaults unknown values to system and keeps the URL a mode switch restores", () => {
     expect(validateNetworkProxy(undefined)).toEqual({
       ok: true,
       value: { mode: "system" },
     });
-    expect(validateNetworkProxy({ mode: "direct", url: "socks5://127.0.0.1:1080" })).toEqual({
+    // System and Direct remember the custom URL and bypass; only `mode`
+    // decides what is in effect (issue #1541).
+    expect(
+      validateNetworkProxy({
+        mode: "direct",
+        url: "  socks5://127.0.0.1:7891  ",
+        bypass: " localhost ",
+      }),
+    ).toEqual({
       ok: true,
-      value: { mode: "direct" },
+      value: {
+        mode: "direct",
+        url: "socks5://127.0.0.1:7891",
+        bypass: "localhost",
+      },
+    });
+    // A URL that cannot describe a proxy is dropped, not refused: it must not
+    // block the mode switch itself.
+    expect(validateNetworkProxy({ mode: "system", url: "not-a-proxy" })).toEqual({
+      ok: true,
+      value: { mode: "system" },
     });
   });
-  it("preserves the explicit fake-IP market opt-in without widening other modes", () => {
+  it("drops the retired fake-IP key from a stored proxy", () => {
+    // The fake-IP tolerance moved to `networkPolicy.mode`; an older stored value
+    // is ignored rather than refused, so an existing profile keeps loading.
     expect(validateNetworkProxy({ mode: "direct", allowFakeIp: true })).toEqual({
       ok: true,
-      value: { mode: "direct", allowFakeIp: true },
+      value: { mode: "direct" },
     });
     expect(validateNetworkProxy({ mode: "system", allowFakeIp: false })).toEqual({
       ok: true,
@@ -95,6 +117,97 @@ describe("validateNetworkProxy", () => {
       ok: true,
       value: { mode: "custom", url: "socks5://127.0.0.1:1080" },
     });
+  });
+
+  it("restores the custom proxy after a detour through system mode", () => {
+    // Every step is what `settings.set` validates, so this is the stored blob.
+    const saved = validateNetworkProxy({
+      mode: "custom",
+      url: "socks5://127.0.0.1:7891",
+      bypass: "localhost,10.8.0.0/24",
+    });
+    if (!saved.ok) throw new Error(saved.error);
+    let stored = saved.value;
+
+    // NetworkProxySection.chooseMode("system") carries the values along.
+    const system = validateNetworkProxy({
+      mode: "system",
+      url: stored.url,
+      bypass: stored.bypass,
+    });
+    if (!system.ok) throw new Error(system.error);
+    stored = system.value;
+    expect(stored).toEqual({
+      mode: "system",
+      url: "socks5://127.0.0.1:7891",
+      bypass: "localhost,10.8.0.0/24",
+    });
+
+    // Choosing Custom again rebuilds it from what the settings still hold,
+    // instead of the built-in default the fields would otherwise fall back to.
+    expect(
+      validateNetworkProxy({
+        mode: "custom",
+        url: stored.url,
+        bypass: stored.bypass,
+      }),
+    ).toEqual({
+      ok: true,
+      value: {
+        mode: "custom",
+        url: "socks5://127.0.0.1:7891",
+        bypass: "localhost,10.8.0.0/24",
+      },
+    });
+  });
+
+  it("uses the current drafts when switching before blur persistence finishes", () => {
+    expect(
+      settingsForInactiveProxyMode(
+        "system",
+        {
+          mode: "custom",
+          url: "socks5://127.0.0.1:1080",
+          bypass: "localhost",
+        },
+        "socks5://127.0.0.1:7891",
+        "localhost,10.8.0.0/24",
+      ),
+    ).toEqual({
+      mode: "system",
+      url: "socks5://127.0.0.1:7891",
+      bypass: "localhost,10.8.0.0/24",
+    });
+  });
+
+  it("retains the last valid URL when the draft is invalid and uses the default for a cleared bypass", () => {
+    expect(
+      settingsForInactiveProxyMode(
+        "direct",
+        {
+          mode: "custom",
+          url: "http://127.0.0.1:7890",
+          bypass: "localhost,10.8.0.0/24",
+        },
+        "not-a-proxy",
+        "   ",
+      ),
+    ).toEqual({
+      mode: "direct",
+      url: "http://127.0.0.1:7890",
+      bypass: DEFAULT_NETWORK_PROXY_BYPASS,
+    });
+  });
+
+  it("does not add default proxy values to a profile without a saved proxy", () => {
+    expect(
+      settingsForInactiveProxyMode(
+        "direct",
+        { mode: "system" },
+        "",
+        DEFAULT_NETWORK_PROXY_BYPASS,
+      ),
+    ).toEqual({ mode: "direct" });
   });
 });
 
@@ -154,17 +267,28 @@ describe("chromium and env projections", () => {
     }).HTTP_PROXY).toBe("http://user:s3cret@10.0.0.1:8080");
   });
 
-  it("omits Chromium <local> from NO_PROXY and does not set HTTP_PROXY for SOCKS", () => {
+  it("omits Chromium <local> from NO_PROXY, keeps the LAN ranges, and does not set HTTP_PROXY for SOCKS", () => {
+    // The default bypass is the user's own machine plus the private ranges a
+    // user's LAN devices live in: a proxy is for reaching the public internet,
+    // and sending a local model server, NAS or MCP endpoint through it is how it
+    // stops answering. `<local>` is Chromium's own single-label rule rather than
+    // an env-var wildcard, so NO_PROXY drops it and keeps everything else.
+    const lanRanges = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16";
+    const envBypass = `localhost,127.0.0.1,::1,${lanRanges}`;
+    // Pinned literally: `crates/host-core/src/network_proxy.rs` carries the same
+    // string for the sidecar's own bypass.
+    expect(DEFAULT_NETWORK_PROXY_BYPASS).toBe(
+      `localhost,127.0.0.1,::1,<local>,${lanRanges}`,
+    );
     const socks = proxyEnvAssignments({
       mode: "custom",
       url: "socks5://127.0.0.1:1080",
     });
     expect(socks.ALL_PROXY).toBe("socks5://127.0.0.1:1080");
     expect(socks.HTTP_PROXY).toBeNull();
-    expect(socks.NO_PROXY).toBe("localhost,127.0.0.1,::1");
-    expect(envProxyBypass({ mode: "custom", url: "http://127.0.0.1:7890" })).toBe(
-      "localhost,127.0.0.1,::1",
-    );
+    expect(socks.NO_PROXY).toBe(envBypass);
+    expect(socks.NO_PROXY ?? "").not.toContain("<local>");
+    expect(envProxyBypass({ mode: "custom", url: "http://127.0.0.1:7890" })).toBe(envBypass);
 
     const http = proxyEnvAssignments({
       mode: "custom",
@@ -202,6 +326,34 @@ describe("normalizeNetworkProxy", () => {
       mode: "custom",
       url: "socks5://127.0.0.1:1080",
       bypass: "localhost",
+    });
+  });
+});
+
+describe("resolveCustomProxyUrl", () => {
+  it("a valid draft wins over the saved URL", () => {
+    const resolved = resolveCustomProxyUrl(
+      "http://draft:8080",
+      "http://saved:3128",
+    );
+    expect(resolved).toEqual({ url: "http://draft:8080", fromDraft: true });
+  });
+
+  it("an invalid draft falls back to the remembered proxy, not the built-in default", () => {
+    const resolved = resolveCustomProxyUrl("garbage", "http://saved:3128");
+    expect(resolved).toEqual({ url: "http://saved:3128", fromDraft: false });
+  });
+
+  it("an empty draft restores the remembered proxy across mode round trips", () => {
+    const resolved = resolveCustomProxyUrl("", "socks5://10.0.0.8:1080");
+    expect(resolved).toEqual({ url: "socks5://10.0.0.8:1080", fromDraft: false });
+  });
+
+  it("with nothing saved the built-in default applies", () => {
+    const resolved = resolveCustomProxyUrl("also bad", undefined);
+    expect(resolved).toEqual({
+      url: "socks5://127.0.0.1:1080",
+      fromDraft: false,
     });
   });
 });

@@ -24,10 +24,13 @@ const [
   appSource,
   stylesSource,
   pkgSource,
+  buildReleaseSource,
   releaseWorkflowSource,
   enSource,
   zhSource,
   changelogSource,
+  changelogLoaderSource,
+  englishChangelogSource,
 ] = await Promise.all([
   read("../../../packages/shared/src/protocol.ts"),
   readSharedTypesSource(),
@@ -41,10 +44,13 @@ const [
   readAppSource(),
   loadStyles(),
   read("../package.json"),
+  read("../../../scripts/build-desktop-release.mjs"),
   read("../../../.github/workflows/release.yml"),
   read("../../../packages/i18n/src/locales/en/index.ts"),
   read("../../../packages/i18n/src/locales/zh-CN/index.ts"),
   read("../../../packages/shared/src/changelog.ts"),
+  read("../../../packages/shared/src/changelog-loader.ts"),
+  read("../../../packages/shared/src/changelog-en.ts"),
 ]);
 
 test("update IPC channels are declared and whitelisted for the preload bridge", () => {
@@ -54,6 +60,7 @@ test("update IPC channels are declared and whitelisted for the preload bridge", 
     "updatesDownload",
     "updatesInstall",
     "updatesOpenReleases",
+    "updatesDismiss",
     "updatesState",
   ]) {
     assert.match(protocolSource, new RegExp(`${channel}:`), channel);
@@ -76,6 +83,7 @@ test("main process registers update handlers and the auto-check lifecycle", () =
     "IPC.invoke.updatesDownload",
     "IPC.invoke.updatesInstall",
     "IPC.invoke.updatesOpenReleases",
+    "IPC.invoke.updatesDismiss",
   ]) {
     assert.ok(mainSource.includes(channel), channel);
   }
@@ -91,14 +99,20 @@ test("main process registers update handlers and the auto-check lifecycle", () =
 });
 
 test("updater gates delivery mode by platform and delivery policy", () => {
-  // Packaged macOS, Windows NSIS, and Linux AppImage use in-app delivery.
-  // Dev builds are disabled outright.
-  assert.match(updaterSource, /if \(!isPackaged\) return "disabled"/);
-  assert.match(updaterSource, /win32.*in-app|in-app.*win32/s);
-  assert.match(updaterSource, /PORTABLE_EXECUTABLE_FILE \? "manual"/);
-  assert.match(updaterSource, /platform === "darwin"[\s\S]*return "in-app"/);
-  assert.match(updaterSource, /APPIMAGE/);
-  assert.match(updaterSource, /autoInstallOnAppQuit = true/);
+  // The pure policy tests cover platform capability and portable defaults.
+  assert.match(updaterSource, /resolveUpdateModePolicy/);
+  assert.match(updaterSource, /resolveDefaultUpdatePreference/);
+  assert.match(updaterSource, /supportsAutomaticUpdates/);
+  assert.match(updaterSource, /piDistribution/);
+  assert.match(updaterSource, /autoUpdater\.autoDownload = false/);
+  assert.match(updaterSource, /autoUpdater\.autoInstallOnAppQuit = false/);
+  assert.match(updaterSource, /autoUpdater\.autoDownload = mode === "in-app"/);
+  assert.match(updaterSource, /autoUpdater\.autoInstallOnAppQuit = mode === "in-app"/);
+  assert.match(updaterSource, /this\.applyPreference\(preference, false\)/);
+  assert.match(updaterSource, /manualReminderTracker/);
+  assert.match(updaterSource, /applyPreference\(this\.preference, false\)/);
+  assert.match(updaterSource, /resolveStoredUpdatePreference/);
+  assert.match(updaterSource, /if \(!preferenceChanged\) return/);
   assert.match(
     updaterSource,
     /allowPrerelease = false/,
@@ -163,6 +177,8 @@ test("renderer exposes the updates API, banner and settings row", () => {
   assert.match(apiSource, /updatesGetState:/);
   assert.match(apiSource, /updatesCheck:/);
   assert.match(apiSource, /updatesInstall:/);
+  assert.match(bannerSource, /update\.dismissed === true/);
+  assert.match(bannerSource, /api\.updatesDismiss\(\)/);
   assert.match(apiSource, /onUpdateState:/);
   assert.match(bannerSource, /updates\.restart/);
   assert.match(bannerSource, /updates\.viewRelease/);
@@ -170,13 +186,22 @@ test("renderer exposes the updates API, banner and settings row", () => {
   assert.match(bannerSource, /releaseNotes/);
   assert.match(bannerSource, /availableVersion}:\$\{update\.status/);
   assert.match(bannerSource, /className="update-notice"/);
+  assert.match(bannerSource, /manualReminder === true/);
   assert.match(bannerSource, /role="progressbar"/);
-  assert.match(settingsSource, /<UpdatesRow currentVersion=/);
+  assert.match(settingsSource, /<UpdatesRow[\s\S]*currentVersion=\{version\?\.version\}/);
+  assert.match(settingsSource, /settings=\{settings\}/);
+  assert.match(settingsSource, /saveSettings=\{saveSettings\}/);
   assert.match(settingsSource, /update-settings-notes/);
   assert.match(settingsSource, /updates\.whatsNew/);
   assert.match(settingsSource, /updates\.releaseNotes/);
+  assert.match(settingsSource, /const ReleaseNotesDialog = lazy\(\(\) =>/);
+  assert.match(settingsSource, /<Suspense[\s\S]*?<ReleaseNotesDialog/);
+  assert.match(settingsSource, /role="status"[\s\S]*?app\.loadingView/);
   assert.match(settingsSource, /<ReleaseNotesDialog/);
-  assert.match(releaseNotesDialogSource, /CHANGELOG\[locale\]/);
+  assert.match(releaseNotesDialogSource, /loadChangelogCatalog\(locale\)/);
+  assert.match(releaseNotesDialogSource, /setLoadedCatalog\(\{ locale, entries: catalog \}\)/);
+  assert.match(changelogLoaderSource, /import\("\.\/changelog-en\.js"\)/);
+  assert.match(changelogLoaderSource, /import\("\.\/changelog-zh-CN\.js"\)/);
   assert.match(releaseNotesDialogSource, /new Intl\.DateTimeFormat\(locale,/);
   assert.match(releaseNotesDialogSource, /role="dialog"/);
   assert.match(releaseNotesDialogSource, /aria-modal="true"/);
@@ -215,25 +240,62 @@ test("check-for-updates is reachable from the application menu", () => {
       "closeReleaseNotes",
       "currentBadge",
       "availableBadge",
+      "preferenceTitle",
+      "preferenceDesc",
+      "automatic",
+      "manual",
+      "automaticUnsupported",
+      "automaticPortableWarning",
+      "preferenceSaveFailed",
     ]) {
       assert.match(source, new RegExp(`${key}:`), key);
     }
   }
 });
 
-test("packaging publishes an electron-updater feed for GitHub Releases", () => {
+test("packaging publishes an electron-updater feed for GitHub Releases", async () => {
   const pkg = JSON.parse(pkgSource);
   assert.ok(pkg.dependencies["electron-updater"], "electron-updater dependency");
   assert.equal(pkg.build.publish[0].provider, "github");
   assert.equal(pkg.build.publish[0].owner, "vastsa");
   assert.equal(pkg.build.publish[0].repo, "PI-Desktop");
+  const windowsUpdateConfigResource = pkg.build.win.extraResources.find(
+    ({ from }) => from === "resources/app-update.yml",
+  );
+  assert.deepEqual(windowsUpdateConfigResource, {
+    from: "resources/app-update.yml",
+    to: "app-update.yml",
+  }, "Windows packages carry the updater config needed by manual ZIP checks");
+  const updateConfig = Object.fromEntries(
+    (await read("../resources/app-update.yml"))
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => {
+        const separator = line.indexOf(":");
+        return [
+          line.slice(0, separator),
+          line.slice(separator + 1).trim().replace(/^['"]|['"]$/g, ""),
+        ];
+      }),
+  );
+  assert.deepEqual(updateConfig, {
+    provider: pkg.build.publish[0].provider,
+    owner: pkg.build.publish[0].owner,
+    repo: pkg.build.publish[0].repo,
+    updaterCacheDirName: `${pkg.name.replaceAll("/", "")}-updater`,
+  });
   const macTargets = pkg.build.mac.target.map((entry) => entry.target);
   assert.ok(macTargets.includes("zip"), "mac zip target (Squirrel.Mac feed)");
   // electron-builder must never self-publish (implicit tag publishing would
   // fail on the missing token and race the softprops release step).
-  for (const script of ["dist", "dist:mac", "dist:win", "dist:linux"]) {
-    assert.match(pkg.scripts[script], /--publish never/, script);
+  for (const script of ["dist:mac", "dist:win", "dist:linux"]) {
+    assert.match(
+      pkg.scripts[script],
+      /--publish never|build-desktop-release\.mjs/,
+      script,
+    );
   }
+  assert.match(pkg.scripts.dist, /build-desktop-release\.mjs/);
   assert.equal(pkg.build.linux.executableName, "pi-desktop");
   const linuxTargets = pkg.build.linux.target.map((entry) => entry.target);
   assert.deepEqual(
@@ -258,16 +320,25 @@ test("packaging publishes an electron-updater feed for GitHub Releases", () => {
   // GitHub asset URLs mangle spaces; keep Windows artifact names space-free.
   assert.equal(pkg.build.nsis.artifactName, "PI-Desktop-Setup-${version}.${ext}");
   const winTargets = pkg.build.win.target.map((entry) => entry.target);
-  assert.deepEqual(winTargets, ["nsis", "portable"], "Windows release targets");
+  assert.deepEqual(winTargets, ["nsis", "zip", "portable"], "Windows release targets");
+  assert.equal(pkg.build.portable.artifactName, "PI-Desktop-Portable-${version}.${ext}", "portable artifact name");
   assert.equal(
-    pkg.build.portable.artifactName,
+    pkg.build.win.artifactName,
     "PI-Desktop-Portable-${version}.${ext}",
   );
-  assert.equal(pkg.build.portable.requestExecutionLevel, "user");
-  assert.equal(
-    pkg.build.portable.unpackDirName,
-    "PI-Desktop-Portable",
-    "portable extraction path stays stable for Windows taskbar identity",
+  assert.equal(pkg.build.extraMetadata.piDistribution, "installed");
+  assert.match(pkg.scripts["dist:win"], /build-desktop-release\.mjs win/);
+  assert.match(buildReleaseSource, /"--win",\s*"nsis"/);
+  assert.match(buildReleaseSource, /"--win",\s*"zip"/);
+  assert.match(buildReleaseSource, /"--win",\s*"portable"/);
+  assert.match(buildReleaseSource, /piDistribution=portable/);
+  assert.match(buildReleaseSource, /"--publish",\s*"never"/);
+  assert.match(buildReleaseSource, /piDistribution=installed/);
+  assert.match(buildReleaseSource, /piDistribution=zip/);
+  assert.match(
+    buildReleaseSource,
+    /shell:\s*process\.platform === "win32"/,
+    "Windows must launch the pnpm.cmd shim through a shell",
   );
   // The upload step must carry every updater feed, and the release publishes
   // all platforms unfiltered (D126/D285).
@@ -282,13 +353,26 @@ test("shared shipped-locale changelog is the in-app notes source of truth", () =
   assert.match(changelogSource, /formatChangelogNotes/);
   assert.match(changelogSource, /"zh-CN"/);
   assert.match(changelogSource, /"zh-TW"/);
-  assert.match(changelogSource, /version: "0\.2\.7"/);
+  assert.match(englishChangelogSource, /version: "0\.2\.7"/);
   assert.match(
     mainSource,
-    /getLocale:\s*\(\)\s*=>\s*updaterLocale/,
+    /getLocale:\s*\(\)\s*=>\s*(?:updaterLocale|mainState\.updaterLocale)/,
     "Main supplies product locale to the updater for note selection",
   );
   assert.match(mainSource, /updater\.refreshReleaseNotes\(\)/);
   assert.match(stylesSource, /\.update-notice-notes/);
   assert.match(stylesSource, /\.update-settings-notes/);
+});
+
+test("update cache relocation and cleanup preserve the delta-update path", async () => {
+  const updateCacheSource = await read("../electron/main/update-cache.ts");
+  const maintenanceSource = await read("../electron/main/update-cache-maintenance.ts");
+  assert.match(updateCacheSource, /PI_DESKTOP_UPDATE_CACHE_DIR/);
+  assert.match(updaterSource, /new RelocatedNsisUpdater\(baseCachePath\)/);
+  assert.match(updaterSource, /relocateUpdateCacheBasePath\(this\.app, baseCachePath\)/);
+  assert.match(maintenanceSource, /readFileSync\([\s\S]*app-update\.yml/);
+  assert.match(mainSource, /reclaimRelocatedUpdateCache/);
+  assert.match(updateCacheSource, /UPDATE_INSTALLER_BASELINE_NAME/);
+  assert.match(updateCacheSource, /UPDATE_BLOCKMAP_BASELINE_NAME/);
+  assert.match(updateCacheSource, /UPDATE_DOWNLOAD_DIR_NAME/);
 });

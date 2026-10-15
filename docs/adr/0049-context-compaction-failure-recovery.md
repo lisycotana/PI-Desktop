@@ -8,7 +8,8 @@
   is no background build left to discard, and the `fresh_window` family issues
   no summary request, so this path cannot trigger there) / ADR 0282 (the
   summary request retries transient failures and the preflight guard sizes
-  the serialized prompt, with one reduced pass, before this fallback runs)
+  the serialized prompt, with one reduced pass, before this fallback runs) /
+  ADR 0302 (the fallback keeps the real recent window rather than one user
 
 ## Context
 
@@ -39,8 +40,7 @@ three-outcome controller:
 
 1. Preflight the summary input against the provider model window. If the
    serialized history plus the summary output allowance cannot fit, skip the
-   doomed summary request; otherwise run the normal pi-agent-core summary
-   compaction.
+   doomed summary request; otherwise run the desktop-owned summary compaction.
 2. If summary generation fails, or a generated checkpoint remains above the
    safe budget, prepare a deterministic fallback checkpoint. It reuses the
    previous checkpoint summary when available, adds a short recovery marker,

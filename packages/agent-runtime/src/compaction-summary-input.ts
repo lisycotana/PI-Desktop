@@ -1,21 +1,29 @@
 import {
-  convertToLlm,
-  serializeConversation,
   type AgentMessage,
-  type CompactionPreparation,
 } from "@earendil-works/pi-agent-core";
-import type { RetryPolicy } from "@earendil-works/pi-ai";
+import type { RetryPolicy, Usage } from "@earendil-works/pi-ai";
+import { truncateMessageText } from "./agent-messages.js";
+import {
+  ESTIMATED_TEXT_CHARS_PER_TOKEN,
+  estimateTokens,
+} from "./pi-runtime-estimates.js";
+import { convertToLlm, serializeConversation } from "./pi-runtime-messages.js";
+import type { CompactionPreparation } from "./pi-runtime-types.js";
+import { DEFAULT_MAX_TOKENS } from "./provider-binding.js";
 
 /**
  * Sizing and retry policy for the automatic summary request (ADR 0282).
  *
- * pi-agent-core serializes the messages it summarizes into one text prompt and
- * caps every tool result at 2 000 characters while doing so. The runtime's
- * budget guard used to add up `estimateTokens` over the raw messages instead,
+ * The desktop summary adapter serializes messages into one text prompt and
+ * caps every tool result at 2 000 characters. The budget guard used to add up
+ * `estimateTokens` over the raw messages instead,
  * so a session whose bulk was tool output looked several times larger than the
  * prompt it would actually send and was routed to retained-tail recovery
  * without ever asking the model (issue #543). These helpers size the prompt the
- * way pi builds it, and shrink the input one bounded step before giving up.
+ * the way the adapter sends it and shrink the input one bounded step — when
+ * even that does not fit, they split the range into chunks that each do, so the
+ * budget decides how many requests a summary takes rather than whether the
+ * model is asked at all (issue #827).
  */
 
 /**
@@ -42,6 +50,27 @@ export const COMPACTION_SUMMARY_RETRY_POLICY: RetryPolicy = {
 export const COMPACTION_REDUCED_TOOL_RESULT_CHARS = 500;
 
 const REDUCED_TOOL_RESULT_SUFFIX = "\n\n[... tool output truncated for the summary request]";
+/**
+ * Tokens held back from the window for the summary prompt template itself, on
+ * top of the model's own output allowance. The preflight guard and the chunk
+ * planner both subtract it, so their budgets cannot disagree.
+ */
+export const COMPACTION_SUMMARY_PROMPT_SAFETY_TOKENS = 2_048;
+/**
+ * Upper bound on the summary requests one checkpoint may issue. A range needing
+ * more than this is not a compaction any more; it falls back.
+ */
+export const COMPACTION_SUMMARY_MAX_CHUNKS = 16;
+/**
+ * Share of a chunk's budget the planner fills. A chunk is sized from
+ * `estimateTokens`, while the request carries pi's serialized form — per-message
+ * role labels and separators the raw estimate does not count — so the margin
+ * keeps every planned request inside the window it was planned for.
+ */
+export const COMPACTION_SUMMARY_CHUNK_MARGIN = 0.9;
+/** Appended when a single message alone exceeds one chunk's budget. */
+export const SUMMARY_CHUNK_TRUNCATION_MARKER =
+  "\n\n[message truncated: the summary request budget could not carry it whole]";
 
 export type CompactionSummaryInput = Pick<
   CompactionPreparation,
@@ -50,8 +79,8 @@ export type CompactionSummaryInput = Pick<
 
 /**
  * Tokens the summary request(s) will carry for this input, using pi's own
- * serialization and the four-characters-per-token heuristic the rest of the
- * runtime uses. A split turn issues two requests (history, then turn prefix);
+ * serialization and text-token estimate. A split turn issues two requests
+ * (history, then turn prefix);
  * the larger one is the one that has to fit.
  */
 export function estimateSummaryPromptTokens(input: CompactionSummaryInput): number {
@@ -62,7 +91,9 @@ export function estimateSummaryPromptTokens(input: CompactionSummaryInput): numb
     input.isSplitTurn && input.turnPrefixMessages.length > 0
       ? serializeConversation(convertToLlm(input.turnPrefixMessages)).length
       : 0;
-  return Math.ceil(Math.max(historyChars, turnPrefixChars) / 4);
+  return Math.ceil(
+    Math.max(historyChars, turnPrefixChars) / ESTIMATED_TEXT_CHARS_PER_TOKEN,
+  );
 }
 
 /**
@@ -113,4 +144,131 @@ function reduceMessage(message: AgentMessage): AgentMessage {
 function boundToolResultText(text: string): string {
   if (text.length <= COMPACTION_REDUCED_TOOL_RESULT_CHARS) return text;
   return text.slice(0, COMPACTION_REDUCED_TOOL_RESULT_CHARS) + REDUCED_TOOL_RESULT_SUFFIX;
+}
+
+/**
+ * Output allowance one summary request gets: the smaller of 80% of the request
+ * headroom and the model's own output budget. pi makes the same computation
+ * when it caps the summary request, so the chunk planner and the guard agree.
+ */
+export function compactionSummaryOutputBudget(input: {
+  requestHeadroom: number;
+  modelMaxTokens?: number;
+}): number {
+  return Math.min(
+    Math.floor(input.requestHeadroom * 0.8),
+    Math.max(1, Math.round(input.modelMaxTokens || DEFAULT_MAX_TOKENS)),
+  );
+}
+
+/**
+ * Tokens the summary prompt may carry inside this window. A prompt at or above
+ * it cannot be sent with room for the summary itself, so the guard rejects it —
+ * and the chunk planner splits the range so every chunk stays below it.
+ */
+export function compactionSummaryInputLimit(input: {
+  hardLimit: number;
+  requestHeadroom: number;
+  modelMaxTokens?: number;
+}): number {
+  return Math.max(
+    1,
+    input.hardLimit +
+      input.requestHeadroom -
+      compactionSummaryOutputBudget(input) -
+      COMPACTION_SUMMARY_PROMPT_SAFETY_TOKENS,
+  );
+}
+
+/**
+ * Split a summary input into contiguous chunks that each fit the request
+ * budget, so a range too large for one prompt is still summarized instead of
+ * skipped (issue #827).
+ *
+ * Every chunk is summarized by its own request and each request carries the
+ * summary of the chunk before it — pi's update-the-summary prompt — so the chain
+ * ends on one summary covering the whole range. `reserveTokens` is the room the
+ * running summary and the previous summary may take in a chunk's prompt.
+ *
+ * Returns undefined when the range cannot be split: it is empty, or it would
+ * need more than {@link COMPACTION_SUMMARY_MAX_CHUNKS} requests. A single
+ * message larger than the budget is truncated rather than dropped, so no message
+ * ever leaves the summary's scope.
+ */
+export function planSummaryChunks(
+  input: CompactionSummaryInput,
+  options: { summaryInputLimit: number; reserveTokens: number },
+): AgentMessage[][] | undefined {
+  const range = [
+    ...input.messagesToSummarize,
+    ...(input.isSplitTurn ? input.turnPrefixMessages : []),
+  ];
+  if (range.length === 0) return undefined;
+  const budget = Math.max(
+    1,
+    Math.floor(
+      (options.summaryInputLimit - Math.max(0, options.reserveTokens)) *
+        COMPACTION_SUMMARY_CHUNK_MARGIN,
+    ),
+  );
+  const chunks: AgentMessage[][] = [];
+  let current: AgentMessage[] = [];
+  let tokens = 0;
+  for (const message of range) {
+    const cost = Math.max(1, Math.ceil(estimateTokens(message)));
+    if (current.length > 0 && tokens + cost > budget) {
+      chunks.push(current);
+      if (chunks.length >= COMPACTION_SUMMARY_MAX_CHUNKS) return undefined;
+      current = [];
+      tokens = 0;
+    }
+    current.push(
+      cost > budget
+        ? truncateMessageText(
+            message,
+            Math.floor(budget * ESTIMATED_TEXT_CHARS_PER_TOKEN),
+            SUMMARY_CHUNK_TRUNCATION_MARKER,
+          )
+        : message,
+    );
+    tokens += Math.min(cost, budget);
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks.length > 0 ? chunks : undefined;
+}
+
+/**
+ * Sum the provider usage of the requests that produced one summary. pi reports
+ * one usage object per request and a chunked summary spends several, so the
+ * checkpoint — and the cost the context inspector shows — carries the total of
+ * the requests the summary actually took.
+ */
+export function addSummaryUsage(
+  total: Usage | undefined,
+  next: Usage | undefined,
+): Usage | undefined {
+  if (!next) return total;
+  if (!total) return next;
+  const cacheWrite1h = total.cacheWrite1h ?? next.cacheWrite1h;
+  const reasoning = total.reasoning ?? next.reasoning;
+  return {
+    input: total.input + next.input,
+    output: total.output + next.output,
+    cacheRead: total.cacheRead + next.cacheRead,
+    cacheWrite: total.cacheWrite + next.cacheWrite,
+    ...(cacheWrite1h === undefined
+      ? {}
+      : { cacheWrite1h: (total.cacheWrite1h ?? 0) + (next.cacheWrite1h ?? 0) }),
+    ...(reasoning === undefined
+      ? {}
+      : { reasoning: (total.reasoning ?? 0) + (next.reasoning ?? 0) }),
+    totalTokens: total.totalTokens + next.totalTokens,
+    cost: {
+      input: (total.cost?.input ?? 0) + (next.cost?.input ?? 0),
+      output: (total.cost?.output ?? 0) + (next.cost?.output ?? 0),
+      cacheRead: (total.cost?.cacheRead ?? 0) + (next.cost?.cacheRead ?? 0),
+      cacheWrite: (total.cost?.cacheWrite ?? 0) + (next.cost?.cacheWrite ?? 0),
+      total: (total.cost?.total ?? 0) + (next.cost?.total ?? 0),
+    },
+  };
 }

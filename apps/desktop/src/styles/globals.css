@@ -27,9 +27,11 @@
 @import "./projects.css";
 @import "./project-create-dialog.css";
 @import "./sessions.css";
+@import "./worktree.css";
 @import "./work-panel.css";
 @import "./providers.css";
 @import "./model-config.css";
+@import "./service-setup.css";
 @import "./chat-links.css";
 @import "./composer-autocomplete.css";
 @import "./plugins.css";

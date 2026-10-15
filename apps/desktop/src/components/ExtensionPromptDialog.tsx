@@ -3,8 +3,10 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import type { TrustedExtensionUiPrompt } from "@pi-desktop/shared";
 import { api } from "../lib/api";
+import { useBlockingOverlay } from "../lib/blocking-overlay";
+import { useHostSafetySurface } from "../lib/host-safety-layer";
 import { useAppStore } from "../stores/app-store";
-import { Button, TooltipButton } from "./ui";
+import { OverlayBackdrop, Button, TooltipButton } from "./ui";
 import { IconClose, IconPlug } from "./icons";
 
 /**
@@ -21,6 +23,10 @@ export function ExtensionPromptHost() {
 
   useEffect(() => {
     const offPrompt = api.onExtensionPrompt((prompt) => {
+      if (prompt.cancelled) {
+        setQueue((prev) => prev.filter((item) => item.promptId !== prompt.promptId));
+        return;
+      }
       setQueue((prev) => (prev.some((p) => p.promptId === prompt.promptId) ? prev : [...prev, prompt]));
     });
     const offStatus = api.onExtensionStatus((event) => {
@@ -80,6 +86,10 @@ function ExtensionPromptDialog({
   );
   const inputRef = useRef<HTMLInputElement | null>(null);
   const dialogId = `extension-prompt-${prompt.promptId}`;
+  // Plugin layers step aside while the user answers, and the docked native
+  // views hide: a WebContentsView composites above this modal otherwise.
+  useHostSafetySurface();
+  useBlockingOverlay();
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow;
@@ -111,7 +121,7 @@ function ExtensionPromptDialog({
       : "";
 
   const dialog = (
-    <div
+    <OverlayBackdrop
       className="overlay session-rename-dialog-overlay extension-prompt-overlay"
       role="presentation"
       onClick={(event) => {
@@ -196,7 +206,7 @@ function ExtensionPromptDialog({
           </div>
         </form>
       </div>
-    </div>
+    </OverlayBackdrop>
   );
   return createPortal(dialog, document.body);
 }

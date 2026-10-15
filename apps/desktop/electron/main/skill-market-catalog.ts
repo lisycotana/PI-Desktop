@@ -8,8 +8,13 @@
  */
 import { net, session } from "electron";
 import type { SkillCatalogEntry, SkillMarketSource } from "@pi-desktop/shared";
+import { fetchPinnedDirect } from "./public-https-direct";
 import { createPublicHttpsClient } from "./public-https-fetch";
-import { currentNetworkProxy } from "./network-proxy";
+import {
+  allowInsecureUserEndpointsEnabled,
+  noteInsecureUserEndpoint,
+  relaxedNetworkPolicyEnabled,
+} from "./endpoint-policy";
 import {
   createSkillMarketAggregator,
   type SkillMarketDocument,
@@ -27,10 +32,25 @@ export { guessSkillCategories } from "./skill-market-scan";
  */
 const client = createPublicHttpsClient({
   fetchImpl: (url, init) => net.fetch(url, init),
+  // A mixed DNS answer may include a public address (or an opted-in
+  // benchmark fake-IP) alongside a synthetic ULA IPv6 address. When the route
+  // is direct, pinning the selected acceptable address keeps net.fetch from
+  // choosing the rejected ULA result itself.
+  pinnedFetchImpl: (url, init, address) => fetchPinnedDirect(url, init, address),
   routeImpl: (url) => session.defaultSession.resolveProxy(url),
-  allowFakeIp: () => currentNetworkProxy().allowFakeIp === true,
+  // Fake-IP answers come from the network policy, not from the proxy switch:
+  // the relaxed mode is what tolerates a transparent router's placeholder
+  // addresses for content the app fetched from a public HTTPS source.
+  allowFakeIp: () => relaxedNetworkPolicyEnabled(),
+  // A source URL the user typed may be a LAN or loopback catalog; the opt-in
+  // for a plaintext hop to it is the stored `networkPolicy`.
+  allowInsecureUserEndpoints: () => allowInsecureUserEndpointsEnabled(),
+  // A plaintext hop to the user's own LAN catalogue is worth one notice.
+  onInsecureUserEndpoint: (host) => noteInsecureUserEndpoint(host),
 });
-const aggregator = createSkillMarketAggregator(client.request);
+const aggregator = createSkillMarketAggregator(client.request, {
+  allowInsecureUserEndpoints: () => allowInsecureUserEndpointsEnabled(),
+});
 
 export function searchSkillMarket(
   query: string,

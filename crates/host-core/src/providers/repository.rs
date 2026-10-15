@@ -75,8 +75,54 @@ pub fn list_providers(
     let mut stmt = db.conn().prepare_cached(&sql)?;
     let rows = stmt.query_map([], |row| provider_from_row(row, secrets))?;
     let mut providers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for provider in &mut providers {
+        hydrate_dynamic_plugin_models(db, provider)?;
+    }
     super::order::apply_saved_order(db, &mut providers)?;
     Ok(providers)
+}
+
+/// An empty model declaration opts an API-key plugin provider into using the
+/// endpoint's cached discovery results. Static manifest models stay authoritative
+/// whenever the plugin declares at least one.
+fn hydrate_dynamic_plugin_models(db: &Database, provider: &mut ProviderPublic) -> Result<()> {
+    if provider.owner_plugin_id.is_none() || !provider.models.is_empty() {
+        return Ok(());
+    }
+    provider.models = list_models(db, Some(&provider.id))?
+        .into_iter()
+        .map(|model| {
+            let alias = (model.display_name != model.model_id).then_some(model.display_name);
+            ModelBinding {
+                id: model.model_id,
+                alias,
+                context_window_source: None,
+                max_tokens_source: None,
+                context_window: model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                max_tokens: DEFAULT_MAX_TOKENS,
+                thinking_levels: Vec::new(),
+                default_thinking_level: None,
+                thinking_protocol: None,
+                supports_images: model
+                    .capabilities
+                    .iter()
+                    .any(|value| value == "vision")
+                    .then_some(true),
+                supports_documents: None,
+                available_for_subagents: None,
+                native_web_search: None,
+            }
+        })
+        .collect();
+    if provider
+        .default_model_id
+        .as_deref()
+        .map(|value| value.is_empty())
+        .unwrap_or(true)
+    {
+        provider.default_model_id = provider.models.first().map(|model| model.id.clone());
+    }
+    Ok(())
 }
 
 pub fn create_provider(
@@ -160,6 +206,99 @@ pub fn create_provider(
     get_provider(db, secrets, &id)?.ok_or_else(|| anyhow::anyhow!("provider missing after create"))
 }
 
+/// Import a user-owned provider while preserving its stable id. Ordinary
+/// settings flows continue to use `create_provider` and receive a fresh UUID;
+/// configuration sync is the only caller allowed to restore an existing id so
+/// repeated imports do not create duplicate provider identities.
+pub(crate) fn create_provider_with_id(
+    db: &Database,
+    secrets: &SecretStore,
+    id: &str,
+    input: ProviderCreateInput,
+) -> Result<ProviderPublic> {
+    if id.trim().is_empty() || id.len() > 128 {
+        bail!("PROVIDER_INVALID: provider id is invalid");
+    }
+    if db
+        .conn()
+        .query_row("SELECT 1 FROM providers WHERE id = ?1", params![id], |_| {
+            Ok(())
+        })
+        .optional()?
+        .is_some()
+    {
+        bail!("PROVIDER_INVALID: provider already exists");
+    }
+    if let Some(models) = input.models.as_deref() {
+        validate_model_aliases(models)?;
+    }
+    let now = now_ms();
+    let secret_ref = secret_ref_for_provider(id);
+    let mut backend = None;
+    if let Some(secret) = input.secret_value.as_ref().filter(|s| !s.is_empty()) {
+        let value = secrets.set(&secret_ref, secret)?;
+        upsert_secret_meta(db, &secret_ref, id, &value)?;
+        backend = Some(value);
+    }
+    let vendor_key = input.vendor_key.unwrap_or_else(|| "custom".into());
+    let provider_type = input
+        .provider_type
+        .unwrap_or_else(|| "openai_compatible".into());
+    let protocol = input.protocol.unwrap_or_else(|| "openai_compatible".into());
+    let auth_kind = input
+        .auth_kind
+        .unwrap_or_else(|| "api_key_and_base_url".into());
+    let config_json = build_provider_config_json(
+        input.supports_reasoning,
+        input.supported_thinking_levels.as_deref(),
+        input.models.as_deref(),
+        &LimitOverrides {
+            context_window: input.context_window,
+            max_output_tokens: input.max_output_tokens,
+            temperature: input.temperature,
+        },
+    )?;
+    let config_json = match input.oauth_account_label.as_deref() {
+        Some(label) => config_with_oauth_account_label(&config_json, label)?,
+        None => config_json,
+    };
+    let config_json = match input.headers.as_ref() {
+        Some(headers) => config_with_headers(&config_json, headers)?,
+        None => config_json,
+    };
+    db.conn()
+        .prepare_cached(
+            "INSERT INTO providers (
+                id, name, vendor_key, type, protocol, enabled, base_url, auth_kind, secret_ref,
+                api_style, default_model_id, config_json, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+        )?
+        .execute(params![
+            id,
+            input.name,
+            vendor_key,
+            provider_type,
+            protocol,
+            input.base_url,
+            auth_kind,
+            if backend.is_some() {
+                Some(secret_ref)
+            } else {
+                None
+            },
+            input.api_style,
+            input.default_model_id.or_else(|| {
+                input
+                    .models
+                    .as_ref()
+                    .and_then(|models| models.first().map(|model| model.id.clone()))
+            }),
+            config_json,
+            now,
+        ])?;
+    get_provider(db, secrets, id)?.ok_or_else(|| anyhow::anyhow!("provider missing after import"))
+}
+
 pub fn update_provider(
     db: &Database,
     secrets: &SecretStore,
@@ -190,16 +329,36 @@ pub fn update_provider(
     if input.models.is_some() {
         ensure_model_bindings_update_safe(&raw_config)?;
     }
+    // The discovered answer belongs to the endpoint that produced it, and the
+    // cached rows carry no endpoint of their own: an edit that moves the address
+    // or the wire format has to drop that answer, or the picker would paint the
+    // previous service's models as this one's. Read before the update moves the
+    // fields into the row.
+    let endpoint_changed = input
+        .base_url
+        .as_deref()
+        .is_some_and(|value| value.trim() != current.base_url.as_deref().unwrap_or("").trim())
+        || input
+            .api_style
+            .as_deref()
+            .is_some_and(|value| value != current.api_style.as_deref().unwrap_or(""));
     // Derive from the API key ref directly: `has_secret` now also covers an
     // OAuth credential, so reusing it here would stamp an api_key ref onto a
     // provider that only ever signed in with a vendor account.
     let api_key_ref = secret_ref_for_provider(&input.id);
-    let mut secret_ref = secrets.has(&api_key_ref).then(|| api_key_ref.clone());
+    let effective_auth_kind = input
+        .auth_kind
+        .as_deref()
+        .unwrap_or(current.auth_kind.as_str());
+    let clear_api_key = effective_auth_kind == "none";
+    let mut secret_ref = (!clear_api_key && secrets.has(&api_key_ref)).then(|| api_key_ref.clone());
 
-    if let Some(secret) = input.secret_value.as_ref().filter(|s| !s.is_empty()) {
-        let backend = secrets.set(&api_key_ref, secret)?;
-        upsert_secret_meta(db, &api_key_ref, &input.id, &backend)?;
-        secret_ref = Some(api_key_ref);
+    if !clear_api_key {
+        if let Some(secret) = input.secret_value.as_ref().filter(|s| !s.is_empty()) {
+            let backend = secrets.set(&api_key_ref, secret)?;
+            upsert_secret_meta(db, &api_key_ref, &input.id, &backend)?;
+            secret_ref = Some(api_key_ref.clone());
+        }
     }
     // `Some(None)` clears an explicit levels override; plain `None` leaves it.
     let levels_update = if input.supported_thinking_levels.is_some() {
@@ -236,6 +395,13 @@ pub fn update_provider(
         None => config_json,
     };
 
+    if clear_api_key {
+        secrets.delete(&api_key_ref)?;
+        db.conn()
+            .prepare_cached("DELETE FROM secrets_meta WHERE secret_ref = ?1")?
+            .execute(params![api_key_ref])?;
+    }
+
     db.conn()
         .prepare_cached(
             "UPDATE providers SET
@@ -248,7 +414,7 @@ pub fn update_provider(
                 default_model_id = COALESCE(?7, default_model_id),
                 api_style = COALESCE(?8, api_style),
                 enabled = COALESCE(?9, enabled),
-                secret_ref = COALESCE(?10, secret_ref),
+                secret_ref = CASE WHEN ?14 THEN NULL ELSE COALESCE(?10, secret_ref) END,
                 config_json = COALESCE(?11, config_json),
                 updated_at = ?12
              WHERE id = ?13",
@@ -271,8 +437,41 @@ pub fn update_provider(
             secret_ref,
             config_json,
             now_ms(),
-            input.id
+            input.id,
+            clear_api_key
         ])?;
+    // A save that drops bindings also forgets their cached rows. The cache is
+    // the service's answer, and a model the user removed is no longer part of
+    // the configuration that answer belongs to; keeping the row would feed the
+    // deleted model's recorded limits back to the next add of the same id.
+    if let Some(models) = input.models.as_deref() {
+        let removed: Vec<String> = current
+            .models
+            .iter()
+            .filter(|binding| {
+                let id = binding.id.trim().to_lowercase();
+                !models
+                    .iter()
+                    .any(|model| model.id.trim().to_lowercase() == id)
+            })
+            .map(|binding| binding.id.clone())
+            .collect();
+        forget_cached_models(db, &input.id, &removed)?;
+    }
+    // A save that moves the endpoint drops the answer the previous one
+    // produced. The models the user configured stay: they are the configuration
+    // the save just wrote, not a cached answer.
+    if endpoint_changed {
+        let configured: Vec<String> = match input.models.as_ref() {
+            Some(models) => models.iter().map(|model| model.id.clone()).collect(),
+            None => current
+                .models
+                .iter()
+                .map(|binding| binding.id.clone())
+                .collect(),
+        };
+        forget_missing_discovered_models(db, &input.id, &configured)?;
+    }
     get_provider(db, secrets, &input.id)
 }
 
@@ -331,7 +530,9 @@ pub(crate) fn delete_provider_row(db: &Database, secrets: &SecretStore, id: &str
 /// `api_key` reference and the row's `secret_ref` change; no field the plugin's
 /// manifest owns is touched, so the next load still refreshes the declaration.
 ///
-/// An empty value deletes the stored key and clears `secret_ref`.
+/// An empty value deletes the stored key and clears `secret_ref`. A fullwidth
+/// value is folded to half-width, the same rule header values follow, because
+/// the key is signed into an HTTP header.
 pub fn set_provider_secret(
     db: &Database,
     secrets: &SecretStore,
@@ -342,12 +543,10 @@ pub fn set_provider_secret(
         return Ok(None);
     }
     let api_key_ref = secret_ref_for_provider(id);
-    match secret_value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    let secret_value = secret_value.map(str::trim).map(fold_fullwidth);
+    match secret_value.filter(|value| !value.is_empty()) {
         Some(value) => {
-            let backend = secrets.set(&api_key_ref, value)?;
+            let backend = secrets.set(&api_key_ref, &value)?;
             upsert_secret_meta(db, &api_key_ref, id, &backend)?;
             db.conn()
                 .prepare_cached(
@@ -375,9 +574,28 @@ pub fn get_provider(
     id: &str,
 ) -> Result<Option<ProviderPublic>> {
     let sql = format!("{PROVIDER_SELECT} WHERE id = ?1");
-    db.conn()
+    let mut provider = db
+        .conn()
         .prepare_cached(&sql)?
         .query_row(params![id], |row| provider_from_row(row, secrets))
-        .optional()
-        .map_err(Into::into)
+        .optional()?;
+    if let Some(provider) = provider.as_mut() {
+        hydrate_dynamic_plugin_models(db, provider)?;
+    }
+    Ok(provider)
+}
+
+/// Whether `id` names a row, whoever owns it.
+///
+/// Reference checks ask this instead of `get_provider` because they only need
+/// to know whether the row still exists: an existing row that is disabled or
+/// carries no credential keeps its references, since the user can repair that
+/// in Settings.
+pub(crate) fn provider_exists(db: &Database, id: &str) -> Result<bool> {
+    Ok(db
+        .conn()
+        .prepare_cached("SELECT 1 FROM providers WHERE id = ?1")?
+        .query_row(params![id], |_| Ok(()))
+        .optional()?
+        .is_some())
 }

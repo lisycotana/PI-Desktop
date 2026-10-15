@@ -64,6 +64,7 @@ test("prompt IPC persists original session text, skips slash expansion and binds
   const calls = [];
   const events = [];
   const sidecarCalls = [];
+  const recordedTurns = [];
   const host = {
     async call(method, params) {
       calls.push({ method, params });
@@ -87,6 +88,7 @@ test("prompt IPC persists original session text, skips slash expansion and binds
     logger: { app() {} }, vendorOAuth: {}, agentExtensions: {}, cancelSessionTools() {},
     persistenceOutbox: {}, dataDir: "/unused-for-no-attachments",
     activeTurns: new Map(), activeTurnUsages: new Map(), approvedExecutionIdsBySession: new Map(), claimedExecutionSessions: new Map(),
+    recordTurnStart: (sessionId, turnId) => recordedTurns.push([sessionId, turnId]),
     resolveAgentRuntimeLaunch: async () => ({
       providerId: "provider", modelId: "model",
       sidecarParams: { sessionId: "target", provider: { modelConfig: { input: ["text"] } } },
@@ -107,6 +109,87 @@ test("prompt IPC persists original session text, skips slash expansion and binds
   assert.equal(row.command, undefined);
   assert.equal(sidecarCalls[0].params.content, message.content);
   assert.deepEqual(sidecarCalls[0].params.sessionMessage, origin);
+  assert.deepEqual(recordedTurns, [["target", "turn-1"]]);
   assert.equal(events.length, 2);
   assert.equal(released, true);
+});
+
+test("abort waits for prompt admission before dispatching to the sidecar", async () => {
+  const handlers = new Map();
+  const calls = [];
+  let releasePrompt;
+  let releaseSessionOperation;
+  let firstSessionOperation = true;
+  const promptGate = new Promise((resolve) => { releasePrompt = resolve; });
+  const sessionGate = new Promise((resolve) => { releaseSessionOperation = resolve; });
+  const host = {
+    async call(method) {
+      calls.push(method);
+      if (method === "settings.get") return {};
+      if (method === "session.get") return { session: { id: "target", messages: [] } };
+      if (method === "session.beginTurn") return { turnId: "turn-1" };
+      if (method === "session.appendMessage") return {};
+      assert.fail(`unexpected RPC ${method}`);
+    },
+  };
+  const activeTurns = new Map();
+  const sidecarCalls = [];
+  const finishedTurns = [];
+  registerAgentIpc({
+    registrar: { handle: (channel, handler) => handlers.set(channel, handler) },
+    getHost: () => host,
+    getSidecar: () => ({
+      setProjectInstructionRoot() {},
+      async call(method, params) {
+        sidecarCalls.push({ method, params });
+        if (method === "agent.prompt") {
+          await promptGate;
+          return { accepted: true, turnId: "turn-1" };
+        }
+        if (method === "agent.abort") return { ok: true, aborted: true };
+        assert.fail(`unexpected sidecar RPC ${method}`);
+      },
+    }),
+    getAgentHostBridge: () => null,
+    logger: { app() {} }, vendorOAuth: {}, agentExtensions: { cancelPrompts() {} }, cancelSessionTools() {},
+    persistenceOutbox: {}, dataDir: "/unused-for-no-attachments",
+    activeTurns, activeTurnUsages: new Map(), approvedExecutionIdsBySession: new Map(), claimedExecutionSessions: new Map(),
+    recordTurnStart() {},
+    resolveAgentRuntimeLaunch: async () => ({
+      providerId: "provider", modelId: "model",
+      sidecarParams: { sessionId: "target", provider: { modelConfig: { input: ["text"] } } },
+    }),
+    acquireSessionOperation: async () => {
+      if (firstSessionOperation) {
+        firstSessionOperation = false;
+        return () => releaseSessionOperation();
+      }
+      await sessionGate;
+      return () => {};
+    },
+    finishTurn: async (...args) => { finishedTurns.push(args); },
+    lockAbortReason() {}, async finishApprovedExecution() {}, async dispatchApprovedPlan() {},
+    async dispatchExecutionForProposal() {}, emitAgentEvent() {}, setNotificationViewingSessionId() {},
+    optionalWorkspaceRoot: async () => null,
+    composerCommandService: { buildComposerCommands: async () => [] },
+    loadComposerTemplatesCached: async () => [],
+  });
+
+  const prompt = handlers.get(IPC.invoke.agentPrompt)({ sessionId: "target", content: "hello" });
+  await Promise.resolve();
+  const abort = handlers.get(IPC.invoke.agentAbort)({ sessionId: "target" });
+  await Promise.resolve();
+  assert.equal(sidecarCalls.includes("agent.abort"), false, "abort must not bypass prompt admission");
+
+  releasePrompt();
+  await prompt;
+  await abort;
+  assert.deepEqual(sidecarCalls.map((call) => call.method), ["agent.prompt", "agent.abort"]);
+  assert.deepEqual(sidecarCalls[1], {
+    method: "agent.abort",
+    params: { sessionId: "target", turnId: "turn-1" },
+  });
+  assert.equal(activeTurns.get("target"), "turn-1");
+  assert.deepEqual(finishedTurns, [["target", "aborted", "TURN_ABORTED", { turnId: "turn-1" }]]);
+  assert.deepEqual(calls.slice(0, 2), ["settings.get", "session.get"]);
 });

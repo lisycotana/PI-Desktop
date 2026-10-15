@@ -99,14 +99,43 @@ export async function checkSidebarSettings({ cdp, check, waitFor, artifactDir })
     })()`);
   };
   const returnToApp = async (width, label, collapsed = false) => {
+    const retainedChat = await cdp.evaluate(`(() => {
+      const chatShell = document.querySelector('.app-chat-shell');
+      const chatSurface = chatShell?.querySelector('.chat-surface');
+      window.__settingsReturnChatSurface = chatSurface ?? null;
+      return {
+        hidden: chatShell?.hidden === true,
+        mounted: chatSurface?.isConnected === true,
+      };
+    })()`);
+    check(
+      retainedChat.hidden && retainedChat.mounted,
+      `${label}: Settings hides the chat while keeping it mounted`,
+      JSON.stringify(retainedChat),
+    );
     await startTrace();
     await click('[data-nav="back-to-app"]');
     await waitFor(() => cdp.evaluate("!document.querySelector('.settings-shell')"), "settings closes");
+    const sameChat = await cdp.evaluate(`(() => {
+      const original = window.__settingsReturnChatSurface;
+      delete window.__settingsReturnChatSurface;
+      return Boolean(original?.isConnected && document.querySelector('.chat-surface') === original);
+    })()`);
+    check(
+      sameChat,
+      `${label}: returning from Settings reveals the same chat surface`,
+      String(sameChat),
+    );
     const trace = await finishTrace();
+    // MutationObserver may sample the same commit before computed layout settles.
+    // Ignore only leading zero-width samples; any later width change still fails.
+    const firstVisibleFrame = trace.frames.findIndex((frame) => frame.width > 0);
+    const checkedFrames =
+      firstVisibleFrame >= 0 ? trace.frames.slice(firstVisibleFrame) : trace.frames;
     check(
       trace.animations.length === 0 && (collapsed
         ? trace.frames.length === 0
-        : trace.frames.length > 0 && trace.frames.every(frame => Math.abs(frame.width - width) < 0.5 && frame.animation === "none")),
+        : checkedFrames.length > 0 && checkedFrames.every(frame => Math.abs(frame.width - width) < 0.5 && frame.animation === "none")),
       `${label}: settings return restores layout without sidebar entrance`,
       JSON.stringify({ animations: trace.animations, widths: trace.frames.map(frame => Math.round(frame.width)) }),
     );

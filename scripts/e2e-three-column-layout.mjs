@@ -19,13 +19,14 @@
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { Host } from "./e2e/host.mjs";
-import { checkSidebarRowStates } from "./e2e/sidebar-row-states.mjs";
+import { checkSidebarProjectMenuPlacement, checkSidebarRowStates } from "./e2e/sidebar-row-states.mjs";
 import { checkSidebarSettings } from "./e2e/sidebar-settings.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -57,7 +58,7 @@ function resolveHostBinary() {
 }
 
 /**
- * Seed four retained project groups into the same throwaway data directory the
+ * Seed five retained project groups into the same throwaway data directory the
  * app will open, using only the host protocol:
  *
  *   alpha   five sessions across four date buckets, so the group draws date
@@ -66,6 +67,7 @@ function resolveHostBinary() {
  *   gamma   no sessions, the empty group
  *   delta   ten sessions that the renderer pins, so the Pinned section has more
  *           rows than its eight-row budget
+ *   history twelve unpinned sessions for the project load-more reset flow
  *
  * `session.import` is the only protocol entry point that accepts a session's own
  * timestamps, which is what puts rows in the yesterday / this-week / older
@@ -83,7 +85,8 @@ async function seedSidebarProjects(hostBinary, dataDir, tempDirs) {
   const beta = join(projectRoot, "beta");
   const gamma = join(projectRoot, "gamma");
   const delta = join(projectRoot, "delta");
-  for (const dir of [alpha, beta, gamma, delta]) mkdirSync(dir, { recursive: true });
+  const history = join(projectRoot, "history");
+  for (const dir of [alpha, beta, gamma, delta, history]) mkdirSync(dir, { recursive: true });
 
   const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);
@@ -144,6 +147,12 @@ async function seedSidebarProjects(hostBinary, dataDir, tempDirs) {
       await importRow(id, title, delta, updatedMs);
       pinnedSessionIds.push(id);
     }
+    const historySessionIds = [];
+    for (let index = 0; index < 12; index += 1) {
+      const id = `e2e-history-project-${index}`;
+      await importRow(id, `history session ${index}`, history, Date.now() - index * 1_000);
+      historySessionIds.push(id);
+    }
 
     // The host canonicalizes every project path; read the stored values back so
     // the renderer's retained-tab list matches exactly.
@@ -156,15 +165,17 @@ async function seedSidebarProjects(hostBinary, dataDir, tempDirs) {
       beta: canonical("e2e-fold-beta-0"),
       gamma,
       delta: canonical("e2e-fold-delta-0"),
+      history: canonical("e2e-history-project-0"),
     };
-    if (!paths.alpha || !paths.beta || !paths.delta) {
+    if (!paths.alpha || !paths.beta || !paths.delta || !paths.history) {
       throw new Error(`seeded sessions carry no project path: ${JSON.stringify(paths)}`);
     }
     return {
       paths,
       alphaSessionIds,
       pinnedSessionIds,
-      keys: [paths.alpha, paths.beta, paths.gamma, paths.delta],
+      historySessionIds,
+      keys: [paths.alpha, paths.beta, paths.gamma, paths.delta, paths.history],
     };
   } finally {
     await host.stop();
@@ -174,6 +185,7 @@ async function seedSidebarProjects(hostBinary, dataDir, tempDirs) {
 class CdpClient {
   constructor(ws) {
     this.ws = ws;
+    this.closed = false;
     this.seq = 0;
     this.pending = new Map();
     this.console = [];
@@ -195,6 +207,13 @@ class CdpClient {
       if (message.error) entry.reject(new Error(JSON.stringify(message.error)));
       else entry.resolve(message.result);
     };
+    ws.onclose = () => {
+      this.closed = true;
+      for (const entry of this.pending.values()) {
+        entry.reject(new Error("CDP websocket closed"));
+      }
+      this.pending.clear();
+    };
   }
 
   static connect(url) {
@@ -206,6 +225,7 @@ class CdpClient {
   }
 
   send(method, params = {}) {
+    if (this.closed) return Promise.reject(new Error("CDP websocket closed"));
     const id = ++this.seq;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -259,9 +279,12 @@ const MEASURE = `(() => {
   const main = document.querySelector(".main-pane");
   const panel = document.querySelector('[data-testid="work-panel"]');
   const sidebar = document.querySelector(".sidebar, .sidebar-rail");
+  const chatShell = document.querySelector(".app-chat-shell");
   const handle = document.querySelector(".work-panel-resize");
   return {
     windowWidth: window.innerWidth,
+    chatHidden: chatShell?.hidden ?? null,
+    settings: Boolean(document.querySelector(".settings-shell")),
     sidebar: round(sidebar),
     sidebarKind: sidebar ? String(sidebar.className).split(" ")[0] : null,
     main: round(main),
@@ -446,6 +469,47 @@ async function main() {
         ),
       "work-panel toggle enabled",
     );
+
+    if (process.argv.includes("--sidebar-only")) {
+      await cdp.send("Page.enable");
+      const sidebarPreferences = {
+        sessionMeta: Object.fromEntries(
+          sidebarSeed.pinnedSessionIds.map((id) => [id, { pinned: true }]),
+        ),
+        projectMeta: {
+          [sidebarSeed.paths.alpha]: { order: 0 },
+          [sidebarSeed.paths.beta]: { order: 1 },
+          [sidebarSeed.paths.gamma]: { order: 2 },
+          [sidebarSeed.paths.delta]: { order: 3 },
+          [sidebarSeed.paths.history]: { order: 4 },
+        },
+        projectSort: "manual",
+        sessionView: { sort: "recent", archived: false },
+        openProjectPaths: sidebarSeed.keys,
+      };
+      await cdp.evaluate(
+        `window.localStorage.setItem("pi.desktop.sidebarPreferences", ${JSON.stringify(JSON.stringify(sidebarPreferences))})`,
+      );
+      await cdp.send("Page.reload", {});
+      const projectKeys = JSON.stringify(sidebarSeed.keys);
+      await waitFor(
+        () => cdp.evaluate(`(() => {
+          const keys = [...document.querySelectorAll("[data-sidebar-project-group]")]
+            .map((element) => element.getAttribute("data-sidebar-project-group"));
+          return !document.querySelector(".startup-splash") &&
+            ${projectKeys}.every((key) => keys.includes(key));
+        })()`),
+        "all seeded project groups load for menu placement",
+      );
+      await checkSidebarProjectMenuPlacement({ cdp, check, waitFor });
+      const failed = results.filter((entry) => !entry.ok);
+      console.log(
+        `E2E-SIDEBAR-menu-placement: ${results.length - failed.length}/${results.length} checks passed`,
+      );
+      cleanup();
+      clearTimeout(timeout);
+      process.exit(failed.length ? 1 : 0);
+    }
 
     const baseline = await measure();
     check(
@@ -1212,7 +1276,7 @@ async function main() {
       await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
       await delay(220);
     };
-    for (const route of ["plugins", "pulls", "scheduled"]) {
+    for (const route of ["plugins", "scheduled"]) {
       if ((await measure()).sidebarKind !== "sidebar") await clickSidebarToggle();
       await rig(`window.__PI_DESKTOP__.setPage(${JSON.stringify(route)})`);
       await waitFor(
@@ -1443,6 +1507,7 @@ async function main() {
         [sidebarSeed.paths.beta]: { order: 1 },
         [sidebarSeed.paths.gamma]: { order: 2 },
         [sidebarSeed.paths.delta]: { order: 3 },
+        [sidebarSeed.paths.history]: { order: 4 },
       },
       projectSort: "manual",
       sessionView: { sort: "recent", archived: false },
@@ -1734,10 +1799,74 @@ async function main() {
     );
     await cdp.evaluate(`document.documentElement.dataset.theme = ${JSON.stringify(originalTheme)}`);
 
-    await checkSidebarRowStates({ cdp, check, waitFor, seed: sidebarSeed });
     await checkSidebarSettings({
       cdp, check, waitFor, artifactDir: process.env.PI_DESKTOP_LAYOUT_ARTIFACT_DIR,
     });
+
+    const crashSentinel = `renderer-crash-${Date.now()}`;
+    await cdp.evaluate(
+      `window.__PI_E2E_RENDERER_CRASH_SENTINEL = ${JSON.stringify(crashSentinel)}`,
+    );
+    void cdp.send("Page.crash").catch(() => undefined);
+    let recoveryCdp = cdp;
+    const recoveryState = await waitFor(async () => {
+      if (recoveryCdp.closed) {
+        const page = (await listTargets(cdpPort).catch(() => [])).find(
+          (candidate) => candidate.type === "page" && candidate.id === target.id,
+        );
+        if (!page?.webSocketDebuggerUrl) return false;
+        const connected = await CdpClient.connect(page.webSocketDebuggerUrl).catch(
+          () => null,
+        );
+        if (!connected) return false;
+        recoveryCdp = connected;
+        activeCdp = recoveryCdp;
+        await recoveryCdp.send("Runtime.enable").catch(() => undefined);
+      }
+      const state = await recoveryCdp
+        .evaluate(`({
+          sentinel: window.__PI_E2E_RENDERER_CRASH_SENTINEL,
+          chatSurface: Boolean(document.querySelector('.chat-surface')),
+          splash: Boolean(document.querySelector('.startup-splash')),
+        })`)
+        .catch(() => null);
+      return state?.chatSurface && !state.splash && state.sentinel !== crashSentinel
+        ? state
+        : false;
+    }, "the renderer automatically reloads after a crash", 90_000);
+    const recoveredTarget = (await listTargets(cdpPort).catch(() => [])).find(
+      (candidate) => candidate.type === "page" && candidate.id === target.id,
+    );
+    check(
+      recoveryState.chatSurface && recoveredTarget?.id === target.id,
+      "the existing app window restores the chat after a renderer crash",
+      JSON.stringify({ recoveryState, targetId: recoveredTarget?.id }),
+    );
+    const diagnostics = await readFile(
+      join(dataDir, "logs", "app", "diagnostics.log"),
+      "utf8",
+    ).catch(() => "");
+    const rendererRecoveryLog = diagnostics
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find(
+        (entry) =>
+          entry?.event === "renderer.process.gone" && entry.data?.reloaded === true,
+      );
+    check(
+      Boolean(rendererRecoveryLog?.data?.reason),
+      "renderer crash recovery records the exit reason and reload decision",
+      JSON.stringify(rendererRecoveryLog),
+    );
+
+    await checkSidebarRowStates({ cdp: recoveryCdp, check, waitFor, seed: sidebarSeed });
 
     const failed = results.filter((entry) => !entry.ok);
     console.log(

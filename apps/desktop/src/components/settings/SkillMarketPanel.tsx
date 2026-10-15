@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
+  allowInsecureUserEndpoints,
   assembleSkillInstall,
   BUILTIN_SKILL_CATALOG,
   GLOBAL_SCOPE,
@@ -25,7 +26,7 @@ import {
   IconListChecks,
   IconX,
 } from "../icons";
-import { Field, Input, TooltipButton, cx } from "../ui";
+import { Input, TooltipButton, cx } from "../ui";
 import { LatestWinsGate } from "../../lib/latest-wins";
 import {
   classifySkillMarketFailure,
@@ -105,10 +106,10 @@ const REMOTE_IDLE: RemoteState = {
 
 const SOURCES_STORAGE_KEY = "pi.skill-market.sources.v1";
 
-function loadSources(): SkillMarketSource[] {
+function loadSources(allowInsecureHttp = false): SkillMarketSource[] {
   try {
     const raw = window.localStorage?.getItem(SOURCES_STORAGE_KEY);
-    return raw ? sanitizeSkillSources(JSON.parse(raw)) : [];
+    return raw ? sanitizeSkillSources(JSON.parse(raw), { allowInsecureHttp }) : [];
   } catch {
     return [];
   }
@@ -166,12 +167,32 @@ export function SkillMarketPanel({
   const [installing, setInstalling] = useState(false);
   const previewGate = useRef(new LatestWinsGate());
   const [sources, setSources] = useState<SkillMarketSource[]>(loadSources);
+  // Whether a plaintext hop to a user-supplied source is allowed, from the
+  // stored `networkPolicy`: the panel re-validates its persisted list with the
+  // same rule the main process applies to the request.
+  const [allowInsecureSources, setAllowInsecureSources] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const [draftSource, setDraftSource] = useState<{ name: string; url: string }>({
     name: "",
     url: "",
   });
   const [remote, setRemote] = useState<RemoteState>(REMOTE_IDLE);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getSettings()
+      .then((settings) => {
+        if (cancelled) return;
+        const insecure = allowInsecureUserEndpoints(settings);
+        setAllowInsecureSources(insecure);
+        if (insecure) setSources(loadSources(true));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     saveSources(sources);
@@ -280,10 +301,27 @@ export function SkillMarketPanel({
         // Swallowing this left the sheet on a null body, so the install button
         // sat disabled behind the word "Loading…" with no reason and no way to
         // try again — the dead end issue #419 reports.
+        const kind = classifySkillMarketFailure(error);
         setPreviewFailure({
-          kind: classifySkillMarketFailure(error),
+          kind,
           detail: skillMarketFailureDetail(error),
         });
+        // The reason belongs to one attempt of opening the sheet, or of asking
+        // it to try again, so it is announced once as a toast. What the sheet
+        // keeps is what stays useful: the recovery hint, the host's own detail,
+        // and the retry control that clear the dead end issue #419 reports.
+        showToast(
+          t(
+            kind === "policy"
+              ? "settings.sklm.previewPolicyError"
+              : kind === "fake-ip"
+                ? "settings.sklm.previewFakeIpError"
+                : kind === "unresolved"
+                  ? "settings.sklm.previewResolveError"
+                  : "settings.sklm.previewError",
+          ),
+          { variant: "error" },
+        );
       });
   };
 
@@ -305,7 +343,6 @@ export function SkillMarketPanel({
       if (assembled.tooLarge) {
         setDocumentBody(assembled.body);
         setDocumentTooLarge(true);
-        showToast(t("settings.sklm.documentTooLarge"), { variant: "error" });
         return;
       }
       const created = await api.createUserSkill({
@@ -334,7 +371,7 @@ export function SkillMarketPanel({
 
   const addSource = () => {
     const url = draftSource.url.trim();
-    if (!isSafeSkillSourceUrl(url)) {
+    if (!isSafeSkillSourceUrl(url, { allowInsecureHttp: allowInsecureSources })) {
       showToast(t("settings.sklm.sourceUnsafe"), { variant: "error" });
       return;
     }
@@ -530,19 +567,7 @@ export function SkillMarketPanel({
 
           <div className="ext-field-group">
             <div className="ext-field-label">{t("settings.sklm.preview")}</div>
-            {previewFailure ? (
-              <p className="sklm-note is-error" role="alert">
-                {t(
-                  previewFailure.kind === "policy"
-                    ? "settings.sklm.previewPolicyError"
-                    : previewFailure.kind === "fake-ip"
-                      ? "settings.sklm.previewFakeIpError"
-                      : previewFailure.kind === "unresolved"
-                        ? "settings.sklm.previewResolveError"
-                        : "settings.sklm.previewError",
-                )}
-              </p>
-            ) : (
+            {previewFailure ? null : (
               <pre className="sklm-preview">{documentBody ?? t("common.loading")}</pre>
             )}
             {previewFailure?.kind === "policy" ? (

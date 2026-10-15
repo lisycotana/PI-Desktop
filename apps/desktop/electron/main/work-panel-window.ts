@@ -21,7 +21,10 @@ export type WorkPanelReservationState = {
 
 export const WORK_PANEL_MIN_WIDTH = 244;
 export const WORK_PANEL_MAX_WIDTH = 720;
-export const WORK_PANEL_CHAT_MIN_WIDTH = 1040;
+/** App-wide minimum window size, in DIP, before clamping to the work area. */
+export const WINDOW_MIN_WIDTH = 800;
+export const WINDOW_MIN_HEIGHT = 560;
+export const WORK_PANEL_CHAT_MIN_WIDTH = WINDOW_MIN_WIDTH;
 export const WORK_PANEL_CHAT_MAX_WIDTH = 10000;
 
 export const emptyWorkPanelReservationState = (): WorkPanelReservationState => ({
@@ -146,6 +149,59 @@ export function clampBoundsToWorkArea(
   const width = Math.min(bounds.width, workArea.width);
   const height = Math.min(bounds.height, workArea.height);
   return clampBoundsOriginToWorkArea({ ...bounds, width, height }, workArea);
+}
+
+/**
+ * Caps a requested minimum window size to the current work area so the OS
+ * never enforces a minimum larger than the display can show (issue #1175:
+ * Windows at 150% scaling reports a ~1280x672 DIP work area). Each dimension
+ * is floored to an integer and kept at least 1.
+ */
+export function clampMinimumSizeToWorkArea(
+  min: { width: number; height: number },
+  workArea: { width: number; height: number },
+): { width: number; height: number } {
+  return {
+    width: Math.max(1, Math.floor(Math.min(min.width, workArea.width))),
+    height: Math.max(1, Math.floor(Math.min(min.height, workArea.height))),
+  };
+}
+
+/** The overshoot a maximized window keeps above the work area. */
+function maximizedBoundsInset(bounds: WindowBounds, workArea: WindowBounds): number {
+  return Math.max(0, workArea.y - bounds.y);
+}
+
+/**
+ * Windows restores a frameless maximized window to the full monitor rect
+ * instead of the work area, leaving the bottom edge below the work area by the
+ * taskbar height (issue #1655). A healthy maximized rect only overshoots the
+ * work area by the same inset above and below it.
+ */
+export function maximizedBoundsExceedWorkArea(
+  bounds: WindowBounds,
+  workArea: WindowBounds,
+): boolean {
+  const inset = maximizedBoundsInset(bounds, workArea);
+  return bounds.y + bounds.height > workArea.y + workArea.height + inset;
+}
+
+/**
+ * The work-area-based maximized rect matching the inset the window already has
+ * above the work area, so re-applying it reproduces the native maximize
+ * footprint instead of shrinking the window inside the taskbar.
+ */
+export function maximizedBoundsForWorkArea(
+  bounds: WindowBounds,
+  workArea: WindowBounds,
+): WindowBounds {
+  const inset = maximizedBoundsInset(bounds, workArea);
+  return {
+    x: workArea.x - inset,
+    y: workArea.y - inset,
+    width: workArea.width + inset * 2,
+    height: workArea.height + inset * 2,
+  };
 }
 
 export function planWorkPanelReservation({

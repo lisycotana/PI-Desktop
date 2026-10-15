@@ -2,6 +2,7 @@ import { app, BrowserWindow, nativeTheme, screen, type Tray } from "electron";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { getModuleDirectory } from "../module-path";
 import {
   APP_NAME,
   builtinWindowBackground,
@@ -9,23 +10,22 @@ import {
   MAC_TRAFFIC_LIGHT_POSITION,
   type CloseBehavior,
 } from "@pi-desktop/shared";
-import type { BrowserPane } from "../browser-view";
+import type { BrowserHost } from "../browser-host";
 import type { HostProcess } from "../host-process";
 import type { Logger } from "../logger";
-import type { PluginRuntime } from "../plugin-runtime";
 import type { PluginViewHost } from "../plugin-view-host";
 import {
   baseWindowBounds,
   clampBoundsOriginToWorkArea,
   clampBoundsToWorkArea,
+  clampMinimumSizeToWorkArea,
   displayWorkAreaKey,
   emptyWorkPanelReservationState,
   isWorkPanelOuterResizeEdge,
-  parseWorkPanelChatWidth,
-  parseWorkPanelReservationWidth,
+  maximizedBoundsExceedWorkArea,
+  maximizedBoundsForWorkArea,
   planWorkPanelChatResize,
   planWorkPanelReservation,
-  reconcileBaseWindowBounds,
   WORK_PANEL_MAX_WIDTH,
   WORK_PANEL_MIN_WIDTH,
   windowBoundsEqual,
@@ -35,6 +35,14 @@ import {
 } from "../work-panel-window";
 import { readWindowState, writeWindowState } from "../window-preferences";
 import { suppressLinuxFramelessSystemMenu } from "../frameless-system-menu";
+import { isWindowFullScreen } from "../window-fullscreen";
+import { DEFAULT_WINDOW_CORNER_RADIUS, installWindowShape } from "../window-shape";
+import {
+  installWindows11CornerController,
+  usesWindows11NativeCorners,
+} from "../window-native-corners";
+import { applyMainWindowBackground, mainWindowBackgroundOptions } from "../window-background";
+import { recoverRendererAfterGone } from "../renderer-recovery";
 
 function windowsIconPath(): string | undefined {
   if (process.platform !== "win32") return undefined;
@@ -93,16 +101,13 @@ export type WindowLifecycleDependencies = {
   observedWorkPanelBaseBounds: (windowBounds: WindowBounds, transition: DisplayTransition) => WindowBounds;
   classifyDisplayTransition: (displayKey: string) => DisplayTransition;
   resetMenuRendererReady: (window: BrowserWindow) => void;
-  markMenuRendererReady: (window: BrowserWindow) => boolean;
-  sendToRenderer: (channel: string, payload: unknown) => void;
   safeOpenExternal: (rawUrl: unknown) => Promise<void>;
   showPluginLauncher: () => Promise<void>;
   askCloseBehavior: (window: BrowserWindow) => Promise<CloseBehavior | null>;
   applyCloseBehavior: (behavior: CloseBehavior) => void;
   createTray: () => void;
-  browserPane: BrowserPane;
+  browserHost: BrowserHost;
   pluginViews: PluginViewHost;
-  plugins: PluginRuntime;
   logger: Pick<Logger, "app">;
 };
 
@@ -120,16 +125,13 @@ export async function createWindow({
   observedWorkPanelBaseBounds,
   classifyDisplayTransition,
   resetMenuRendererReady,
-  markMenuRendererReady,
-  sendToRenderer,
   safeOpenExternal,
   showPluginLauncher,
   askCloseBehavior,
   applyCloseBehavior,
   createTray,
-  browserPane,
+  browserHost,
   pluginViews,
-  plugins,
   logger,
 }: WindowLifecycleDependencies): Promise<void> {
 
@@ -163,8 +165,18 @@ export async function createWindow({
   const restoredBounds = savedState
     ? clampBoundsToWorkArea(savedState, restoreWorkArea)
     : null;
-  const initialMinWidth = Math.min(windowMinWidth, restoreWorkArea.width);
-  const initialMinHeight = Math.min(windowMinHeight, restoreWorkArea.height);
+  const { width: initialMinWidth, height: initialMinHeight } =
+    clampMinimumSizeToWorkArea(
+      { width: windowMinWidth, height: windowMinHeight },
+      restoreWorkArea,
+    );
+  const initialWindowBackground = builtinWindowBackground(
+    nativeTheme.shouldUseDarkColors ? "dark" : "light",
+  );
+  const windows11NativeCorners = usesWindows11NativeCorners(
+    process.platform,
+    process.getSystemVersion(),
+  );
   windowState.mainWindow = new BrowserWindow({
     ...(restoredBounds ?? { width: 1200, height: 800 }),
     minWidth: initialMinWidth,
@@ -191,8 +203,12 @@ export async function createWindow({
         }
       : {
           frame: false,
-          backgroundColor: builtinWindowBackground(
-            nativeTheme.shouldUseDarkColors ? "dark" : "light",
+          ...(process.platform === "win32" ? { thickFrame: false } : {}),
+          ...mainWindowBackgroundOptions(
+            process.platform,
+            initialWindowBackground,
+            windows11NativeCorners,
+            initialWindowBackground,
           ),
         }),
     ...(process.platform === "win32"
@@ -201,7 +217,7 @@ export async function createWindow({
         }
       : {}),
     webPreferences: {
-      preload: join(__dirname, "../preload/index.cjs"),
+      preload: join(getModuleDirectory(import.meta.url), "../preload/index.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -212,6 +228,26 @@ export async function createWindow({
     },
   });
   const window = windowState.mainWindow;
+  if (process.platform === "win32") {
+    if (windows11NativeCorners) {
+      await installWindows11CornerController(
+        window,
+        DEFAULT_WINDOW_CORNER_RADIUS,
+        () => windowState.host,
+        screen,
+        logger,
+      );
+    } else {
+      installWindowShape(window, DEFAULT_WINDOW_CORNER_RADIUS, screen);
+    }
+  }
+  applyMainWindowBackground(
+    window,
+    process.platform,
+    initialWindowBackground,
+    windows11NativeCorners,
+    initialWindowBackground,
+  );
   suppressLinuxFramelessSystemMenu(window);
   const initialBounds = window.getBounds();
   windowState.workPanelBaseBounds = restoredBounds
@@ -307,11 +343,14 @@ export async function createWindow({
       width: Math.max(0, currentBounds.width - nextBaseBounds.width),
       xOffset: currentBounds.x - nextBaseBounds.x,
     };
-    const minimumWidth = Math.max(
-      windowMinWidth,
-      Math.min(display.workArea.width, windowMinWidth + panelWidth),
+    const minimumWidth = Math.min(
+      display.workArea.width,
+      windowMinWidth + panelWidth,
     );
-    window.setMinimumSize(minimumWidth, windowMinHeight);
+    window.setMinimumSize(
+      minimumWidth,
+      Math.min(windowMinHeight, display.workArea.height),
+    );
     sendWorkPanelResize("commit", panelWidth);
   };
 
@@ -332,7 +371,7 @@ export async function createWindow({
     if (
       nativeWorkPanelResize ||
       windowState.requestedWorkPanelReservation <= 0 ||
-      window.isFullScreen() ||
+      isWindowFullScreen(window) ||
       window.isMaximized()
     ) {
       return nativeWorkPanelResize;
@@ -365,7 +404,7 @@ export async function createWindow({
     if (
       !isLiveWindow() ||
       windowState.requestedWorkPanelReservation <= 0 ||
-      window.isFullScreen() ||
+      isWindowFullScreen(window) ||
       window.isMaximized()
     ) {
       return windowState.workPanelBaseBounds?.width ?? windowMinWidth;
@@ -390,17 +429,18 @@ export async function createWindow({
       reservationWidth: windowState.workPanelReservation.width,
       requestedWidth,
     });
-    const minimumWidth = Math.max(
-      windowMinWidth,
-      Math.min(display.workArea.width, windowMinWidth + next.reservation.width),
+    const minimumWidth = Math.min(
+      display.workArea.width,
+      windowMinWidth + next.reservation.width,
     );
+    const minimumHeight = Math.min(windowMinHeight, display.workArea.height);
     if (next.bounds.width < currentBounds.width) {
-      window.setMinimumSize(minimumWidth, windowMinHeight);
+      window.setMinimumSize(minimumWidth, minimumHeight);
     }
     windowState.expectedWorkPanelBounds = next.bounds;
     window.setBounds(next.bounds, false);
     if (next.bounds.width >= currentBounds.width) {
-      window.setMinimumSize(minimumWidth, windowMinHeight);
+      window.setMinimumSize(minimumWidth, minimumHeight);
     }
     const appliedBounds = window.getBounds();
     windowState.expectedWorkPanelBounds = appliedBounds;
@@ -468,12 +508,37 @@ export async function createWindow({
     void safeOpenExternal(url).catch(() => undefined);
     return { action: "deny" };
   });
+  let windowCloseAccepted = false;
   window.webContents.on("did-start-loading", () => {
+    browserHost.disposeGuest();
     windowState.notificationViewingSessionId = null;
     if (windowState.mainWindow === window) resetMenuRendererReady(window);
   });
-  window.webContents.on("render-process-gone", () => {
+  window.webContents.on("render-process-gone", (_event, details) => {
     windowState.notificationViewingSessionId = null;
+    recoverRendererAfterGone(details, {
+      isCurrentWindow: windowState.mainWindow === window,
+      quitting: windowState.quitting,
+      windowCloseAccepted,
+      windowDestroyed: window.isDestroyed(),
+      webContentsDestroyed: window.webContents.isDestroyed(),
+      reload: () => window.webContents.reload(),
+      log: (rendererDetails, reloaded) => {
+        logger.app(
+          "diagnostics",
+          rendererDetails.reason === "clean-exit" ? "info" : "warn",
+          "renderer process exited",
+          {
+            event: "rendererProcessGone",
+            data: {
+              reason: rendererDetails.reason,
+              exitCode: rendererDetails.exitCode,
+              reloaded,
+            },
+          },
+        );
+      },
+    });
   });
 
   // Devtools shortcut, gated on developer mode. Frameless windows get no
@@ -481,6 +546,18 @@ export async function createWindow({
   // null, so F12 is wired here; macOS additionally inherits Cmd+Alt+I from
   // the View menu role (see application-menu.ts).
   window.webContents.on("before-input-event", (event, input) => {
+    const isReloadChord =
+      input.type === "keyDown" &&
+      input.code === "KeyR" &&
+      input.control &&
+      !input.meta &&
+      !input.alt &&
+      !input.shift;
+    if (isReloadChord) {
+      // Keep an accidental browser reload from discarding transient app-shell state.
+      event.preventDefault();
+      return;
+    }
     const isPluginLauncherChord =
       process.platform === "win32" &&
       windowState.pluginLauncherBinding === "Alt+Space" &&
@@ -516,13 +593,13 @@ export async function createWindow({
   const sendFullScreen = () => {
     if (window.isDestroyed() || window.webContents.isDestroyed()) return;
     window.webContents.send(IPC.event.windowFullScreen, {
-      fullScreen: window.isFullScreen(),
+      fullScreen: isWindowFullScreen(window),
     });
   };
   window.on("enter-full-screen", sendFullScreen);
   window.on("leave-full-screen", () => {
     sendFullScreen();
-    refitWindowToWorkArea();
+    refitWindowToWorkArea(true);
     scheduleWorkPanelReservation();
   });
   window.webContents.on("did-finish-load", sendFullScreen);
@@ -539,15 +616,27 @@ export async function createWindow({
   // area — e.g. a display-scale or accessibility "text size" change inflated a
   // persisted rect past the screen (issue #544). Fit them back inside so the
   // window never lands partly off-screen. macOS keeps its own restore behavior.
-  const refitWindowToWorkArea = () => {
+  // A `leave-full-screen` fires while the window may still report the stale
+  // maximize flag from the pre-fullscreen state (issue #1655). The refit must
+  // still run there, or the window keeps bounds sized for a display it is no
+  // longer on. Callers that legitimately sit on a maximized window (unmaximize,
+  // restore) keep the original bail-out.
+  const refitWindowToWorkArea = (ignoreMaximized = false) => {
     if (!isLiveWindow() || process.platform === "darwin") return;
-    if (window.isMaximized() || window.isFullScreen() || window.isMinimized()) return;
+    if (
+      (window.isMaximized() && !ignoreMaximized) ||
+      isWindowFullScreen(window) ||
+      window.isMinimized()
+    ) {
+      return;
+    }
     const currentBounds = window.getBounds();
     const workArea = screen.getDisplayMatching(currentBounds).workArea;
-    window.setMinimumSize(
-      Math.min(windowMinWidth, workArea.width),
-      Math.min(windowMinHeight, workArea.height),
+    const minimum = clampMinimumSizeToWorkArea(
+      { width: windowMinWidth, height: windowMinHeight },
+      workArea,
     );
+    window.setMinimumSize(minimum.width, minimum.height);
     const fitted = clampBoundsToWorkArea(currentBounds, workArea);
     if (windowBoundsEqual(fitted, currentBounds)) return;
     windowState.expectedWorkPanelBounds = fitted;
@@ -627,13 +716,27 @@ export async function createWindow({
   // mistaken for one (D263).
   const reconcileDisplayTopology = () => {
     windowState.workPanelUserMovePending = false;
+    // A scale or text-size change shrinks the DIP work area in place; re-cap the
+    // minimum so the OS never enforces one the display cannot show (issue #1175).
+    // Keep the open work panel's reservation in the minimum; only cap it.
+    // `isWindowFullScreen` rather than `isFullScreen`: the borderless Win32
+    // fallback leaves Electron's own flag false while the window really is
+    // fullscreen, and resizing the minimum then fights the fullscreen state
+    // (issue #1655).
+    if (isLiveWindow() && !isWindowFullScreen(window)) {
+      const minimum = clampMinimumSizeToWorkArea(
+        { width: workPanelMinimumWindowWidth(), height: windowMinHeight },
+        screen.getDisplayMatching(window.getBounds()).workArea,
+      );
+      window.setMinimumSize(minimum.width, minimum.height);
+    }
     reconcileWorkPanelDisplay();
   };
   screen.on("display-metrics-changed", reconcileDisplayTopology);
   screen.on("display-added", reconcileDisplayTopology);
   screen.on("display-removed", reconcileDisplayTopology);
 
-  browserPane.setWindow(window);
+  browserHost.setWindow(window);
   pluginViews.setWindow(window);
   window.on("closed", () => {
     screen.removeListener("display-metrics-changed", reconcileDisplayTopology);
@@ -658,7 +761,7 @@ export async function createWindow({
     }
     if (windowState.mainWindow !== window) return;
     windowState.mainWindow = null;
-    browserPane.setWindow(null);
+    browserHost.setWindow(null);
     pluginViews.setWindow(null);
     if (
       process.platform !== "darwin" &&
@@ -748,7 +851,11 @@ export async function createWindow({
     boundsGuard = true;
     try {
       if (window.isMinimized()) window.restore();
-      window.setMinimumSize(windowMinWidth, windowMinHeight);
+      const minimum = clampMinimumSizeToWorkArea(
+        { width: windowMinWidth, height: windowMinHeight },
+        screen.getDisplayMatching(electronBounds).workArea,
+      );
+      window.setMinimumSize(minimum.width, minimum.height);
       // Prefer normal layer so CG helpers and Stage Manager stay stable.
       window.setAlwaysOnTop(false);
       window.show();
@@ -815,6 +922,35 @@ export async function createWindow({
   window.on("show", () => ensureStableBounds(false));
   window.on("focus", () => ensureStableBounds(false));
   window.on("restore", () => ensureStableBounds(false));
+
+  // Windows restores a frameless maximized window to the full monitor rect
+  // instead of the work area, so the window covers the taskbar and reads as
+  // fullscreen (issue #1655). Re-apply the work-area-based maximized rect.
+  const reconcileRestoredMaximize = () => {
+    if (!isLiveWindow() || process.platform !== "win32") return;
+    if (
+      !window.isMaximized() ||
+      isWindowFullScreen(window) ||
+      window.isMinimized()
+    ) {
+      return;
+    }
+    const bounds = window.getBounds();
+    const workArea = screen.getDisplayMatching(bounds).workArea;
+    if (!maximizedBoundsExceedWorkArea(bounds, workArea)) return;
+    window.setBounds(maximizedBoundsForWorkArea(bounds, workArea));
+  };
+  // The OS finishes the restore after the event dispatch, overwriting a
+  // synchronous correction, so try now and again once the transition settles.
+  let restoredMaximizeTimer: NodeJS.Timeout | null = null;
+  window.on("restore", () => {
+    reconcileRestoredMaximize();
+    if (restoredMaximizeTimer) clearTimeout(restoredMaximizeTimer);
+    restoredMaximizeTimer = setTimeout(() => {
+      restoredMaximizeTimer = null;
+      reconcileRestoredMaximize();
+    }, windowBoundsSettleMs);
+  });
   window.on("resize", observeNativeWorkPanelResize);
   window.on("move", scheduleBoundsCheck);
   window.on("move", noteUserWindowMove);
@@ -826,7 +962,8 @@ export async function createWindow({
       !isLiveWindow() ||
       boundsGuard ||
       windowState.workPanelNativeResizeActive ||
-      windowState.workPanelChatResizeActive
+      windowState.workPanelChatResizeActive ||
+      isWindowFullScreen(window)
     ) {
       return;
     }
@@ -886,6 +1023,7 @@ export async function createWindow({
       windowState.quitting ||
       windowsAllowedToClose.has(window)
     ) {
+      windowCloseAccepted = true;
       return;
     }
     event.preventDefault();
@@ -982,6 +1120,10 @@ export async function createWindow({
     if (workPanelSettleExpiryTimer) {
       clearTimeout(workPanelSettleExpiryTimer);
       workPanelSettleExpiryTimer = null;
+    }
+    if (restoredMaximizeTimer) {
+      clearTimeout(restoredMaximizeTimer);
+      restoredMaximizeTimer = null;
     }
     if (boundsWatchdog) clearInterval(boundsWatchdog);
   });
@@ -1418,16 +1560,20 @@ export async function createWindow({
             await new Promise((r) => setTimeout(r, 250));
             captureViewportOverride = true;
             try {
-              windowState.mainWindow!.setMinimumSize(1040, 700);
-              windowState.mainWindow!.setSize(1040, 700, false);
+              windowState.mainWindow!.setMinimumSize(windowMinWidth, windowMinHeight);
+              windowState.mainWindow!.setSize(windowMinWidth, windowMinHeight, false);
               await new Promise((r) => setTimeout(r, 350));
               await probeWorkPanelHeader("minimum-supported");
               await shot("pi-panel-minimum-supported");
             } finally {
               windowState.mainWindow!.setSize(CODEX_BOUNDS.width, CODEX_BOUNDS.height, false);
+              const restoredMinimum = clampMinimumSizeToWorkArea(
+                { width: workPanelMinimumWindowWidth(), height: windowMinHeight },
+                screen.getDisplayMatching(windowState.mainWindow!.getBounds()).workArea,
+              );
               windowState.mainWindow!.setMinimumSize(
-                workPanelMinimumWindowWidth(),
-                windowMinHeight,
+                restoredMinimum.width,
+                restoredMinimum.height,
               );
               captureViewportOverride = false;
             }
@@ -1588,9 +1734,13 @@ export async function createWindow({
               `);
             } finally {
               windowState.mainWindow!.setSize(CODEX_BOUNDS.width, CODEX_BOUNDS.height, false);
+              const restoredMinimum = clampMinimumSizeToWorkArea(
+                { width: workPanelMinimumWindowWidth(), height: windowMinHeight },
+                screen.getDisplayMatching(windowState.mainWindow!.getBounds()).workArea,
+              );
               windowState.mainWindow!.setMinimumSize(
-                workPanelMinimumWindowWidth(),
-                windowMinHeight,
+                restoredMinimum.width,
+                restoredMinimum.height,
               );
               captureViewportOverride = false;
             }
@@ -1606,17 +1756,11 @@ export async function createWindow({
             await setSettingsTab("projects");
             await new Promise((r) => setTimeout(r, 800));
             await shot("pi-dark-project-archive");
-            await setPage("pulls");
-            await new Promise((r) => setTimeout(r, 800));
-            await shot("pi-dark-pulls");
             await setPage("settings");
             await setSettingsTab("general");
             await new Promise((r) => setTimeout(r, 800));
             await shot("pi-dark-settings");
             await setTheme("light");
-            await setPage("pulls");
-            await new Promise((r) => setTimeout(r, 600));
-            await shot("pi-pulls-live");
             await setSettingsTab("projects");
             await new Promise((r) => setTimeout(r, 500));
             await shot("pi-project-archive-live");
@@ -1828,16 +1972,17 @@ export async function createWindow({
             // which is still dark from the destination pass; the remaining
             // settings scenes are light so the tabs read as one sequence.
             await setTheme("light");
-            // Model configuration tab: vendor accounts, provider cards,
-            // defaults, edit dialog. Addressed by tab id — the settings nav
+            // Model configuration tab: defaults, the service list (API services
+            // and subscription accounts together), then a row's editor — a row
+            // opens its own editor. Addressed by tab id — the settings nav
             // has been reordered since this scene was written.
             await setSettingsTab("agent");
             await new Promise((r) => setTimeout(r, 350));
             await shot("pi-settings-models");
             await windowState.mainWindow!.webContents.executeJavaScript(`
               (() => {
-                const edit = [...document.querySelectorAll('.provider-row-actions .provider-icon-btn')][0];
-                const add = document.querySelector('.provider-section-head button');
+                const edit = document.querySelector('.model-provider-row.is-openable');
+                const add = document.querySelector('.model-provider-add');
                 (edit ?? add)?.dispatchEvent(new MouseEvent('click',{bubbles:true}));
               })()
             `);
@@ -1847,27 +1992,13 @@ export async function createWindow({
               document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
             `);
             await new Promise((r) => setTimeout(r, 200));
-            // Plugins marketplace: the source picker lives beside the catalog,
-            // including the custom URL row that only appears for that source.
+            // Plugins marketplace uses the fixed official catalog.
             await setPage("plugins");
             await windowState.mainWindow!.webContents.executeJavaScript(
               `document.querySelector('#plugins-tab-market')?.dispatchEvent(new MouseEvent('click',{bubbles:true}))`,
             );
             await new Promise((r) => setTimeout(r, 350));
             await shot("pi-settings-extensions");
-            await windowState.mainWindow!.webContents.executeJavaScript(`
-              (() => {
-                const select = document.querySelector('.plugins-market-settings select');
-                if (!select) return;
-                const setter = Object.getOwnPropertyDescriptor(
-                  window.HTMLSelectElement.prototype, 'value',
-                )?.set;
-                setter?.call(select, 'custom');
-                select.dispatchEvent(new Event('change', { bubbles: true }));
-              })()
-            `);
-            await new Promise((r) => setTimeout(r, 350));
-            await shot("pi-settings-extensions-custom");
             await setPage("chat");
             await setTheme("light");
             await new Promise((r) => setTimeout(r, 250));
@@ -1987,6 +2118,8 @@ export async function createWindow({
       window.webContents.openDevTools({ mode: "detach" });
     }
   } else {
-    await window.loadFile(join(__dirname, "../renderer/index.html"));
+    await window.loadFile(
+      join(getModuleDirectory(import.meta.url), "../renderer/index.html"),
+    );
   }
 }

@@ -21,7 +21,7 @@
  * and api/replay details depend on the binding.
  */
 
-import { estimateTokens } from "@earendil-works/pi-agent-core";
+import { estimateTokens } from "./pi-runtime-estimates.js";
 import type {
   AssistantMessage,
   Message,
@@ -217,6 +217,12 @@ export function taskObjectiveFromArgs(args: unknown): string {
  * result. An orphan tool row (its assistant lost to a truncated branch) gets a
  * synthesized carrier so the pair stays well-formed — providers reject an
  * unpaired `toolUse`.
+ *
+ * Assistant transport identity is `model.provider` / `model.id` (the same
+ * values live requests use), not the account row id. A vendorKey-bound model
+ * has `model.provider !== provider.id`; tagging history with the account id
+ * makes pi-ai treat same-model reasoning as foreign and empty
+ * `reasoning_content` on Task(resume).
  */
 export function chainRowsToMessages(
   rows: readonly UiMessage[],
@@ -268,8 +274,8 @@ export function chainRowsToMessages(
         role: "assistant",
         content,
         api,
-        provider: provider.id,
-        model: provider.modelId,
+        provider: model.provider,
+        model: model.id,
         usage: usageToPi(row.usage),
         stopReason: "stop",
         timestamp,
@@ -283,8 +289,8 @@ export function chainRowsToMessages(
           role: "assistant",
           content: [],
           api,
-          provider: provider.id,
-          model: provider.modelId,
+          provider: model.provider,
+          model: model.id,
           usage: usageToPi(undefined),
           stopReason: "toolUse",
           timestamp,
@@ -456,7 +462,29 @@ function toolResultFromUi(m: UiMessage, timestamp: number): ToolResultMessage {
           : MISSING_TOOL_RESULT_PLACEHOLDER,
     });
   }
-  const details = toJsonValue(isRecord(raw) ? raw.details : undefined);
+  const rawRecord = isRecord(raw) ? raw : undefined;
+  const rawDetails = toJsonValue(rawRecord?.details);
+  const legacyAddedToolNames =
+    m.toolName === "ToolSearch" && Array.isArray(rawRecord?.addedToolNames)
+      ? rawRecord.addedToolNames.filter(
+          (name: unknown): name is string =>
+            typeof name === "string" && name.length > 0,
+        )
+      : [];
+  const canonicalAddedToolNames =
+    isRecord(rawDetails) && Array.isArray(rawDetails.addedToolNames)
+      ? rawDetails.addedToolNames.filter(
+          (name: unknown): name is string =>
+            typeof name === "string" && name.length > 0,
+        )
+      : [];
+  const details =
+    legacyAddedToolNames.length > 0 && canonicalAddedToolNames.length === 0
+      ? {
+          ...(isRecord(rawDetails) ? rawDetails : {}),
+          addedToolNames: [...new Set(legacyAddedToolNames)],
+        }
+      : rawDetails;
   return {
     role: "toolResult",
     toolCallId: m.toolCallId ?? "",

@@ -1,14 +1,24 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { AppSettings, NetworkProxyMode, NetworkProxySettings } from "@pi-desktop/shared";
+import type {
+  AppSettings,
+  NetworkPolicyMode,
+  NetworkPolicySettings,
+  NetworkProxyMode,
+  NetworkProxySettings,
+} from "@pi-desktop/shared";
 import {
   DEFAULT_NETWORK_PROXY_BYPASS,
+  isRelaxedNetworkPolicy,
   parseProxyUrl,
+  resolveCustomProxyUrl,
+  settingsForInactiveProxyMode,
   validateNetworkProxy,
 } from "@pi-desktop/shared";
 import { api } from "../../lib/api";
-import { Button, Input, cx } from "../ui";
+import { Button, Input, SegmentedControl, SettingsToggle, cx } from "../ui";
 import { SettingsRow } from "../../features/settings/primitives";
+import { useAppStore } from "../../stores/app-store";
 
 const MODES: NetworkProxyMode[] = ["system", "direct", "custom"];
 
@@ -30,7 +40,7 @@ export function NetworkProxySection({
     saved.bypass ?? DEFAULT_NETWORK_PROXY_BYPASS,
   );
   const [urlError, setUrlError] = useState(false);
-  const [saveError, setSaveError] = useState(false);
+  const showToast = useAppStore((state) => state.showToast);
   const [testState, setTestState] = useState<"idle" | "busy" | "ok" | "fail">(
     "idle",
   );
@@ -49,11 +59,10 @@ export function NetworkProxySection({
       return;
     }
     setUrlError(false);
-    setSaveError(false);
     try {
       await saveSettings({ networkProxy: validated.value });
     } catch {
-      setSaveError(true);
+      showToast(t("settings.proxySaveError"), { variant: "error" });
     }
   };
 
@@ -61,17 +70,21 @@ export function NetworkProxySection({
     if (mode === saved.mode) return;
     setTestState("idle");
     if (mode !== "custom") {
-      void persist({ mode, allowFakeIp: saved.allowFakeIp });
+      // Blur can start an async save, so read the current drafts here instead
+      // of relying on `saved` to have refreshed before this click completes.
+      void persist(
+        settingsForInactiveProxyMode(mode, saved, urlDraft, bypassDraft),
+      );
       return;
     }
-    const parsed = parseProxyUrl(urlDraft);
-    const url = parsed.ok ? parsed.value.href : "socks5://127.0.0.1:1080";
-    if (!parsed.ok) setUrlDraft(url);
+    // A stale invalid draft loses to the remembered proxy: restoring the
+    // user's own URL on re-entry is the whole point of remembering it.
+    const resolved = resolveCustomProxyUrl(urlDraft, saved.url);
+    if (!resolved.fromDraft) setUrlDraft(resolved.url);
     void persist({
       mode: "custom",
-      url,
+      url: resolved.url,
       bypass: bypassDraft.trim() || undefined,
-      allowFakeIp: saved.allowFakeIp,
     });
   };
 
@@ -90,7 +103,6 @@ export function NetworkProxySection({
       mode: "custom",
       url: parsed.value.href,
       bypass: bypassDraft.trim() || undefined,
-      allowFakeIp: saved.allowFakeIp,
     });
   };
 
@@ -100,7 +112,7 @@ export function NetworkProxySection({
     setBypassDraft(next);
     if (next === (saved.bypass ?? DEFAULT_NETWORK_PROXY_BYPASS)) return;
     if (!saved.url) return;
-    void persist({ mode: "custom", url: saved.url, bypass: next, allowFakeIp: saved.allowFakeIp });
+    void persist({ mode: "custom", url: saved.url, bypass: next });
   };
 
   const runTest = async () => {
@@ -112,9 +124,8 @@ export function NetworkProxySection({
             mode: "custom",
             url: urlDraft.trim() || saved.url,
             bypass: bypassDraft.trim() || undefined,
-            allowFakeIp: saved.allowFakeIp,
           }
-        : { mode: saved.mode, allowFakeIp: saved.allowFakeIp };
+        : { mode: saved.mode };
     try {
       const result = await api.testNetworkProxy(payload);
       if (result.ok) {
@@ -136,6 +147,26 @@ export function NetworkProxySection({
     }
   };
 
+  const relaxed = isRelaxedNetworkPolicy(settings);
+
+  /**
+   * Only the `networkPolicy` field is written: the settings write merges this
+   * patch into the stored settings, so every other preference is carried over
+   * untouched. A notice the user already acknowledged stays acknowledged: the
+   * mode is the only thing this switch changes.
+   */
+  const persistNetworkPolicy = async (mode: NetworkPolicyMode) => {
+    const next: NetworkPolicySettings = { mode };
+    if (settings.networkPolicy?.insecureNoticeAcknowledged === true) {
+      next.insecureNoticeAcknowledged = true;
+    }
+    try {
+      await saveSettings({ networkPolicy: next });
+    } catch {
+      showToast(t("settings.proxySaveError"), { variant: "error" });
+    }
+  };
+
   return (
     <section className="settings-card-block">
       <h3 className="settings-card-heading">{t("settings.network")}</h3>
@@ -144,44 +175,29 @@ export function NetworkProxySection({
           title={t("settings.proxy")}
           description={t("settings.proxyDesc")}
         >
-          <div
-            className="settings-segment"
-            role="radiogroup"
-            aria-label={t("settings.proxy")}
-          >
-            {MODES.map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                role="radio"
-                aria-checked={saved.mode === mode}
-                className={cx(
-                  "settings-segment-item",
-                  saved.mode === mode && "active",
-                )}
-                onClick={() => chooseMode(mode)}
-              >
-                {t(`settings.proxy${mode[0]!.toUpperCase()}${mode.slice(1)}`)}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            value={saved.mode}
+            onChange={(mode) => chooseMode(mode)}
+            options={MODES.map((mode) => ({
+              value: mode,
+              label: t(`settings.proxy${mode[0]!.toUpperCase()}${mode.slice(1)}`),
+            }))}
+            label={t("settings.proxy")}
+          />
         </SettingsRow>
         <SettingsRow
-          title={t("settings.proxyFakeIp")}
-          description={t("settings.proxyFakeIpDesc")}
+          title={t("settings.networkRelaxedMode")}
+          description={
+            relaxed
+              ? t("settings.networkRelaxedModeDesc")
+              : t("settings.networkRelaxedModeStrictDesc")
+          }
         >
-          <button
-            type="button"
-            className={cx("settings-toggle", saved.allowFakeIp && "on")}
-            role="switch"
-            aria-checked={saved.allowFakeIp === true}
-            aria-label={t("settings.proxyFakeIp")}
-            onClick={() =>
-              void persist({ ...saved, allowFakeIp: saved.allowFakeIp !== true })
-            }
-          >
-            <span className="settings-toggle-thumb" />
-          </button>
+          <SettingsToggle
+            checked={relaxed}
+            label={t("settings.networkRelaxedMode")}
+            onChange={() => void persistNetworkPolicy(relaxed ? "strict" : "relaxed")}
+          />
         </SettingsRow>
 
         {saved.mode === "custom" ? (
@@ -255,11 +271,6 @@ export function NetworkProxySection({
           </>
         ) : null}
 
-        {saveError ? (
-          <span className="settings-command-shell-state error" role="status">
-            {t("settings.proxySaveError")}
-          </span>
-        ) : null}
       </div>
     </section>
   );
