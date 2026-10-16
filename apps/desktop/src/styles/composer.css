@@ -149,7 +149,7 @@
 }
 
 /* Motion layered on the promoted row, chosen by the queued-prompt animation
-   setting (Settings → appearance). The accent bar itself never moves; each
+   setting (Settings → AI → Defaults). The accent bar itself never moves; each
    variant only adds decoration on top of it, and every animation stands down
    under prefers-reduced-motion. */
 [data-queue-animation="bubbles"] .composer-queued-prompt[data-priority="true"],
