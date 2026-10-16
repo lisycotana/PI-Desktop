@@ -33,6 +33,7 @@ window.piDesktop = {
         localStorage.setItem("queue-fixture-settings", JSON.stringify(settings));
         data = settings; break;
       case IPC.invoke.agentQueueList: data = { entries: queued }; break;
+      case IPC.invoke.backgroundTasksList: data = { tasks: [] }; break;
       case IPC.invoke.providersList: data = { providers: [] }; break;
       case IPC.invoke.sessionList: data = { sessions: useAppStore.getState().sessions }; break;
       case IPC.invoke.commandShellList: data = { choices: [], effective: null }; break;
